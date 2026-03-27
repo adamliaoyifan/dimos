@@ -9,13 +9,28 @@ Runs a background landmark-creation loop:
 
 Exposes RPC queries that the NavDPSkillContainer calls.
 Publishes a top-down map image for the agent or visualization.
+
+Debug / improvement logging
+---------------------------
+When ``debug_log_dir`` is set (default: ``{memory_base_dir}/debug``), every
+session writes:
+
+    {debug_log_dir}/{session_id}/
+        events.jsonl          — append-only event log (landmarks, queries, …)
+        session_meta.json     — config snapshot + session bookkeeping
+        snapshots/            — periodic memory snapshots (every auto_save_interval_s)
+
+This data is intended for offline analysis and threshold tuning.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import threading
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 import numpy as np
@@ -29,6 +44,38 @@ from dimos.msgs.sensor_msgs import Image
 from dimos.msgs.sensor_msgs.Image import ImageFormat
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Debug event logger — append-only JSONL
+# ---------------------------------------------------------------------------
+
+class _DebugEventLog:
+    """Thread-safe, append-only JSONL writer for memory events."""
+
+    def __init__(self, log_dir: str) -> None:
+        os.makedirs(log_dir, exist_ok=True)
+        self._path = os.path.join(log_dir, "events.jsonl")
+        self._lock = threading.Lock()
+        self._fh = open(self._path, "a", encoding="utf-8")
+
+    # -- public API --
+
+    def log(self, event_type: str, **data: Any) -> None:
+        """Append one event record."""
+        record = {
+            "ts": time.time(),
+            "t": event_type,
+            **data,
+        }
+        line = json.dumps(record, default=str) + "\n"
+        with self._lock:
+            self._fh.write(line)
+            self._fh.flush()
+
+    def close(self) -> None:
+        with self._lock:
+            self._fh.close()
 
 # Lazy NavDP imports
 _nb = None
@@ -121,6 +168,8 @@ class NavDPMemory(Module):
         landmark_interval_m: float = 1.0,
         revisit_sim_thresh: float = 0.85,
         revisit_uncertainty_thresh: float = 0.96,
+        auto_save_interval_s: float = 60.0,
+        debug_log_dir: str | None = None,
     ) -> None:
         self._vlm_url = vlm_server_url
         self._embedding_url = embedding_server_url
@@ -129,6 +178,15 @@ class NavDPMemory(Module):
         self._landmark_interval_m = landmark_interval_m
         self._revisit_sim_thresh = revisit_sim_thresh
         self._uncertainty_thresh = revisit_uncertainty_thresh
+        self._auto_save_interval = auto_save_interval_s
+
+        # Debug logging
+        self._session_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        self._debug_dir = os.path.join(
+            debug_log_dir or os.path.join(memory_base_dir, "debug"),
+            self._session_id,
+        )
+        self._event_log: _DebugEventLog | None = None
 
         # Runtime
         self._spatial_memory = None
@@ -139,6 +197,10 @@ class NavDPMemory(Module):
         self._latest_odom: tuple[float, float, float] | None = None
         self._running = False
         self._map_thread: threading.Thread | None = None
+        self._save_thread: threading.Thread | None = None
+        self._landmark_count = 0
+        self._query_count = 0
+        self._start_time: float = 0.0
 
         super().__init__()
 
@@ -162,6 +224,17 @@ class NavDPMemory(Module):
             logger=logger,
         )
 
+        # --- Debug logging ---
+        self._start_time = time.time()
+        try:
+            self._event_log = _DebugEventLog(self._debug_dir)
+            self._write_session_meta()
+            self._event_log.log("session_start")
+            logger.info("NavDPMemory debug log: %s", self._debug_dir)
+        except Exception:
+            logger.warning("Could not create debug log dir", exc_info=True)
+            self._event_log = None
+
         # Subscribe to streams
         self._disposables.add(
             Disposable(self.color_image.subscribe(self._on_image))
@@ -176,6 +249,13 @@ class NavDPMemory(Module):
             target=self._map_publish_loop, daemon=True, name="navdp-map"
         )
         self._map_thread.start()
+
+        # Background auto-save loop
+        self._save_thread = threading.Thread(
+            target=self._auto_save_loop, daemon=True, name="navdp-autosave"
+        )
+        self._save_thread.start()
+
         logger.info("NavDPMemory started (memory_dir=%s)", self._memory_base_dir)
 
     @rpc
@@ -183,16 +263,34 @@ class NavDPMemory(Module):
         self._running = False
         if self._map_thread is not None:
             self._map_thread.join(timeout=3.0)
+        if self._save_thread is not None:
+            self._save_thread.join(timeout=3.0)
+
         # Save snapshot on shutdown
         if self._spatial_memory is not None:
             try:
-                import os
-
                 path = os.path.join(self._memory_base_dir, "snapshot.json")
                 self._spatial_memory.save_snapshot(path)
                 logger.info("Saved spatial memory to %s", path)
             except Exception:
                 logger.exception("Failed to save spatial memory snapshot")
+
+            # Also save a timestamped snapshot in debug dir
+            self._save_debug_snapshot("shutdown")
+
+        # Write session summary
+        if self._event_log is not None:
+            summary = self.get_memory_summary()
+            self._event_log.log(
+                "session_end",
+                duration_s=round(time.time() - self._start_time, 1),
+                landmarks_created=self._landmark_count,
+                queries_served=self._query_count,
+                **summary,
+            )
+            self._event_log.close()
+            logger.info("Debug session written to %s", self._debug_dir)
+
         super().stop()
 
     # --- Stream callbacks ---
@@ -204,6 +302,9 @@ class NavDPMemory(Module):
         # Feed to landmark manager
         if self._landmark_manager is not None and self._latest_odom is not None:
             odom = self._latest_odom
+            prev_node_count = (
+                len(self._spatial_memory.nodes) if self._spatial_memory else 0
+            )
             try:
                 self._landmark_manager.update(
                     rgb=bgr,
@@ -213,10 +314,79 @@ class NavDPMemory(Module):
                 )
             except Exception:
                 logger.debug("Landmark update failed", exc_info=True)
+                return
+
+            # Detect new landmark creation
+            new_count = (
+                len(self._spatial_memory.nodes) if self._spatial_memory else 0
+            )
+            if new_count > prev_node_count and self._event_log:
+                self._landmark_count += 1
+                node = self._spatial_memory.nodes[-1]
+                self._event_log.log(
+                    "landmark_created",
+                    node_id=getattr(node, "node_id", new_count - 1),
+                    odom_x=round(odom[0], 3),
+                    odom_y=round(odom[1], 3),
+                    odom_yaw=round(odom[2], 3),
+                    room_type=getattr(node, "room_type", ""),
+                    scene_description=getattr(node, "scene_description", "")[:200],
+                    detected_objects=getattr(node, "detected_objects", []),
+                    total_nodes=new_count,
+                )
 
     def _on_odom(self, odom: PoseStamped) -> None:
         with self._lock:
             self._latest_odom = _pose_to_xyyaw(odom)
+
+    # --- Session metadata & auto-save ---
+
+    def _write_session_meta(self) -> None:
+        """Write session configuration for reproducibility."""
+        meta = {
+            "session_id": self._session_id,
+            "start_time": datetime.now(timezone.utc).isoformat(),
+            "config": {
+                "vlm_server_url": self._vlm_url,
+                "embedding_server_url": self._embedding_url,
+                "memory_base_dir": self._memory_base_dir,
+                "embedding_model": self._embedding_model,
+                "landmark_interval_m": self._landmark_interval_m,
+                "revisit_sim_thresh": self._revisit_sim_thresh,
+                "revisit_uncertainty_thresh": self._uncertainty_thresh,
+                "auto_save_interval_s": self._auto_save_interval,
+            },
+        }
+        path = os.path.join(self._debug_dir, "session_meta.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
+
+    def _auto_save_loop(self) -> None:
+        """Periodically save memory snapshots to prevent data loss on crash."""
+        snap_dir = os.path.join(self._debug_dir, "snapshots")
+        os.makedirs(snap_dir, exist_ok=True)
+        save_count = 0
+        while self._running:
+            time.sleep(self._auto_save_interval)
+            if not self._running:
+                break
+            self._save_debug_snapshot(f"auto_{save_count:04d}")
+            save_count += 1
+
+    def _save_debug_snapshot(self, label: str) -> None:
+        """Save a timestamped snapshot + summary to the debug dir."""
+        if self._spatial_memory is None:
+            return
+        snap_dir = os.path.join(self._debug_dir, "snapshots")
+        os.makedirs(snap_dir, exist_ok=True)
+        try:
+            path = os.path.join(snap_dir, f"{label}.json")
+            self._spatial_memory.save_snapshot(path)
+            if self._event_log:
+                summary = self.get_memory_summary()
+                self._event_log.log("snapshot_saved", label=label, path=path, **summary)
+        except Exception:
+            logger.debug("Debug snapshot failed", exc_info=True)
 
     # --- Map rendering loop ---
 
@@ -245,6 +415,24 @@ class NavDPMemory(Module):
 
     # --- RPC queries (called by NavDPSkillContainer) ---
 
+    def _log_query(self, method: str, query: str, results: list[dict[str, Any]]) -> None:
+        """Log a query event for debug/threshold tuning."""
+        self._query_count += 1
+        if self._event_log:
+            odom = self._latest_odom
+            self._event_log.log(
+                "query",
+                method=method,
+                query=query,
+                num_results=len(results),
+                top_score=results[0].get("score", results[0].get("confidence", 0))
+                if results
+                else 0,
+                results=results[:3],  # top 3 for brevity
+                robot_x=round(odom[0], 3) if odom else None,
+                robot_y=round(odom[1], 3) if odom else None,
+            )
+
     @rpc
     def query_by_text(self, query: str) -> list[dict[str, Any]]:
         """Query spatial memory by text description.
@@ -266,6 +454,7 @@ class NavDPMemory(Module):
                 "x": node.odom_x,
                 "y": node.odom_y,
             })
+        self._log_query("query_by_text", query, out)
         return out
 
     @rpc
@@ -290,6 +479,7 @@ class NavDPMemory(Module):
                 "y": node.odom_y,
                 "room_type": node.room_type,
             })
+        self._log_query("query_by_object", object_name, out)
         return out
 
     @rpc
@@ -302,8 +492,14 @@ class NavDPMemory(Module):
             return None
         cluster = self._spatial_memory.query_room(room_query)
         if cluster is None:
+            if self._event_log:
+                self._query_count += 1
+                self._event_log.log(
+                    "query", method="query_room", query=room_query,
+                    num_results=0, top_score=0, results=[],
+                )
             return None
-        return {
+        result = {
             "cluster_id": cluster.cluster_id,
             "room_name": cluster.room_name,
             "room_type": cluster.room_type,
@@ -311,6 +507,8 @@ class NavDPMemory(Module):
             "centroid_y": cluster.centroid_y,
             "node_count": len(cluster.node_ids),
         }
+        self._log_query("query_room", room_query, [result])
+        return result
 
     @rpc
     def list_rooms(self) -> list[dict[str, Any]]:
@@ -410,10 +608,33 @@ class NavDPMemory(Module):
         """
         if self._spatial_memory is None or self._latest_odom is None:
             return False
-        # We store a special "tagged" room cluster with 0 nodes and the name
         odom = self._latest_odom
         logger.info("Tagged location %r at (%.2f, %.2f)", name, odom[0], odom[1])
+        if self._event_log:
+            self._event_log.log(
+                "tag_location", name=name,
+                x=round(odom[0], 3), y=round(odom[1], 3),
+            )
         return True
+
+
+    @rpc
+    def get_debug_log_path(self) -> str:
+        """Return the path to the current session's debug log directory."""
+        return self._debug_dir
+
+    @rpc
+    def get_session_stats(self) -> dict[str, Any]:
+        """Return live session statistics for monitoring."""
+        summary = self.get_memory_summary()
+        return {
+            "session_id": self._session_id,
+            "uptime_s": round(time.time() - self._start_time, 1) if self._start_time else 0,
+            "landmarks_created": self._landmark_count,
+            "queries_served": self._query_count,
+            "debug_log_dir": self._debug_dir,
+            **summary,
+        }
 
 
 navdp_memory = NavDPMemory.blueprint
