@@ -19,7 +19,7 @@ from reactivex.disposable import Disposable
 
 from dimos.agents.annotation import skill
 from dimos.core.core import rpc
-from dimos.core.module import Module
+from dimos.core.module import Module, ModuleConfig
 from dimos.core.stream import In
 from dimos.models.qwen.bbox import BBox
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
@@ -34,11 +34,24 @@ from dimos.utils.logging_config import setup_logger
 logger = setup_logger()
 
 
-class NavigationSkillContainer(Module):
+class NavigationSkillConfig(ModuleConfig):
+    vlm_backend: str = "qwen"
+    """VLM backend: 'qwen' (Alibaba API), 'qwen_local' (local server)."""
+
+    vlm_base_url: str = "http://localhost:8000/v1"
+    """Base URL for the local VLM server (only used with vlm_backend='qwen_local')."""
+
+    vlm_model_name: str = "Qwen/Qwen2.5-VL-3B-Instruct"
+    """Model name for the local VLM server (only used with vlm_backend='qwen_local')."""
+
+
+class NavigationSkillContainer(Module[NavigationSkillConfig]):
     _latest_image: Image | None = None
     _latest_odom: PoseStamped | None = None
     _skill_started: bool = False
     _similarity_threshold: float = 0.23
+
+    default_config = NavigationSkillConfig
 
     rpc_calls: list[str] = [
         "SpatialMemory.tag_location",
@@ -60,10 +73,23 @@ class NavigationSkillContainer(Module):
         super().__init__(**kwargs)
         self._skill_started = False
 
-        # Here to prevent unwanted imports in the file.
-        from dimos.models.vl.qwen import QwenVlModel
+        if self.config.vlm_backend == "qwen3_local":
+            from dimos.models.vl.qwen3_local import Qwen3LocalVlModel
 
-        self._vl_model = QwenVlModel()
+            self._vl_model = Qwen3LocalVlModel(
+                base_url=self.config.vlm_base_url,
+            )
+        elif self.config.vlm_backend == "qwen_local":
+            from dimos.models.vl.qwen_local import QwenLocalVlModel
+
+            self._vl_model = QwenLocalVlModel(
+                base_url=self.config.vlm_base_url,
+                model_name=self.config.vlm_model_name,
+            )
+        else:
+            from dimos.models.vl.qwen import QwenVlModel
+
+            self._vl_model = QwenVlModel()
 
     @rpc
     def start(self) -> None:

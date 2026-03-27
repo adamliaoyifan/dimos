@@ -1,0 +1,49 @@
+# VLN (Vision-and-Language Navigation) Configuration
+# ---------------------------------------------------
+# Usage:
+#   from dimos.agents.skills.config import load_vln_config
+#   cfg = load_vln_config("path/to/vln_config.yaml")
+
+# ── VLM (Vision-Language Model) ──────────────────────────────────────
+vlm:
+  # Backend: "qwen3_local" (custom Qwen3-VL server), "qwen_local" (OpenAI-compat),
+  #          "qwen" (Alibaba cloud), "moondream" (local HF)
+  backend: qwen3_local
+
+  # Custom Qwen3-VL-8B server on RTX 5090 (no /v1 suffix — endpoints include it)
+  base_url: http://192.168.2.109:8000
+  model_name: Qwen3-VL-8B-Instruct
+
+# ── Agent LLM ────────────────────────────────────────────────────────
+agent:
+  # Ollama Qwen3 14B on the same host
+  model: ollama:qwen3:14b
+  ollama_base_url: http://192.168.2.109:11434
+
+# ── Search behaviour ─────────────────────────────────────────────────
+search:
+  vlm_check_interval: 1.0
+  search_timeout: 120.0
+  approach_timeout: 30.0
+  similarity_threshold: 0.23
+
+# ── NavDP (diffusion-policy navigation) ────────────────────────────
+# Set enabled: true if NavDP inference server is running
+navdp:
+  enabled: false
+  navdp_server_url: http://192.168.2.109:8880
+  vlm_server_url: http://192.168.2.109:8000
+
+# ── Escape / stuck recovery ───────────────────────────────────────
+escape:
+  enabled: true
+  stuck_time_window: 6.0
+  stuck_distance_threshold: 0.05
+  escape_backup_distance: 0.3
+  escape_rotate_degrees: 90.0
+  max_escape_attempts: 4
+
+# ── Blueprint options ────────────────────────────────────────────────
+blueprint:
+  enable_tts: false
+  n_workers: 8
