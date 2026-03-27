@@ -48,6 +48,9 @@ class Qwen3LocalVlModelConfig(VlModelConfig):
     temperature: float = 0.1
     top_p: float = 0.9
 
+    prompt_prefix: str = ""
+    """Prefix prepended to every VLM prompt. Used for simulation context."""
+
 
 class Qwen3LocalVlModel(VlModel[Qwen3LocalVlModelConfig]):
     """Qwen3-VL model backed by a custom FastAPI inference server.
@@ -79,6 +82,10 @@ class Qwen3LocalVlModel(VlModel[Qwen3LocalVlModelConfig]):
         image, _ = self._prepare_image(image)
 
         img_base64 = image.to_base64()
+
+        # Prepend simulation/context prefix if configured
+        if self.config.prompt_prefix:
+            query = self.config.prompt_prefix + query
 
         client = self._get_client()
         url = f"{self.config.base_url}/v1/image-inference-base64"

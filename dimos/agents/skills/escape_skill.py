@@ -73,6 +73,9 @@ class EscapeConfig(ModuleConfig):
     enable_vlm_check: bool = True
     """Whether to use VLM to confirm wall/obstacle before escaping."""
 
+    vlm_prompt_prefix: str = ""
+    """Prefix prepended to every VLM prompt (e.g. simulation context)."""
+
 
 class EscapeSkillContainer(Module[EscapeConfig]):
     """Detects when the robot is stuck against a wall and escapes.
@@ -120,7 +123,10 @@ class EscapeSkillContainer(Module[EscapeConfig]):
         """Create VLM for wall detection."""
         if self.config.vlm_backend == "qwen3_local":
             from dimos.models.vl.qwen3_local import Qwen3LocalVlModel
-            return Qwen3LocalVlModel(base_url=self.config.vlm_base_url)
+            return Qwen3LocalVlModel(
+                base_url=self.config.vlm_base_url,
+                prompt_prefix=self.config.vlm_prompt_prefix,
+            )
         elif self.config.vlm_backend == "qwen_local":
             from dimos.models.vl.qwen_local import QwenLocalVlModel
             return QwenLocalVlModel(base_url=self.config.vlm_base_url)

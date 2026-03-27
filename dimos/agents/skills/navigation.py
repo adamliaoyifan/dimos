@@ -44,6 +44,9 @@ class NavigationSkillConfig(ModuleConfig):
     vlm_model_name: str = "Qwen/Qwen2.5-VL-3B-Instruct"
     """Model name for the local VLM server (only used with vlm_backend='qwen_local')."""
 
+    vlm_prompt_prefix: str = ""
+    """Prefix prepended to every VLM prompt (e.g. simulation context)."""
+
 
 class NavigationSkillContainer(Module[NavigationSkillConfig]):
     _latest_image: Image | None = None
@@ -78,6 +81,7 @@ class NavigationSkillContainer(Module[NavigationSkillConfig]):
 
             self._vl_model = Qwen3LocalVlModel(
                 base_url=self.config.vlm_base_url,
+                prompt_prefix=self.config.vlm_prompt_prefix,
             )
         elif self.config.vlm_backend == "qwen_local":
             from dimos.models.vl.qwen_local import QwenLocalVlModel

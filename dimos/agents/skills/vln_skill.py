@@ -69,6 +69,9 @@ class VLNConfig(ModuleConfig):
     vlm_model_name: str = "Qwen3-VL-8B-Instruct"
     """Model name (used by qwen_local backend only)."""
 
+    vlm_prompt_prefix: str = ""
+    """Prefix prepended to every VLM prompt (e.g. simulation context)."""
+
 
 class VLNSkillContainer(Module[VLNConfig]):
     """Vision-and-Language Navigation skill for compound goals.
@@ -129,6 +132,7 @@ class VLNSkillContainer(Module[VLNConfig]):
 
             return Qwen3LocalVlModel(
                 base_url=self.config.vlm_base_url,
+                prompt_prefix=self.config.vlm_prompt_prefix,
             )
         elif backend == "qwen_local":
             from dimos.models.vl.qwen_local import QwenLocalVlModel

@@ -75,6 +75,20 @@ class BlueprintConfig:
 
 
 @dataclass
+class SimulationConfig:
+    enabled: bool = False
+    vlm_prompt_prefix: str = (
+        "IMPORTANT: This image is from a 3D simulation, NOT a real camera. "
+        "The scene uses simple 3D-rendered graphics with flat shading, basic "
+        "geometry, and minimal textures. Objects may look like low-poly 3D "
+        "models (e.g. a desk is a simple rectangular shape, chairs are basic "
+        "shapes). Interpret objects by their SHAPE and POSITION, not by "
+        "photorealistic appearance. A rectangular shape on legs is likely a "
+        "desk or table. A shape with a seat and backrest is a chair.\n\n"
+    )
+
+
+@dataclass
 class VLNTestConfig:
     vlm: VLMConfig = field(default_factory=VLMConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
@@ -82,6 +96,7 @@ class VLNTestConfig:
     navdp: NavDPConfig = field(default_factory=NavDPConfig)
     escape: EscapeConfig = field(default_factory=EscapeConfig)
     blueprint: BlueprintConfig = field(default_factory=BlueprintConfig)
+    simulation: SimulationConfig = field(default_factory=SimulationConfig)
 
 
 def load_vln_config(path: str | Path | None = None) -> VLNTestConfig:
@@ -109,6 +124,7 @@ def load_vln_config(path: str | Path | None = None) -> VLNTestConfig:
         navdp=NavDPConfig(**raw.get("navdp", {})),
         escape=EscapeConfig(**raw.get("escape", {})),
         blueprint=BlueprintConfig(**raw.get("blueprint", {})),
+        simulation=SimulationConfig(**raw.get("simulation", {})),
     )
 
 
@@ -120,5 +136,6 @@ __all__ = [
     "NavDPConfig",
     "EscapeConfig",
     "BlueprintConfig",
+    "SimulationConfig",
     "load_vln_config",
 ]

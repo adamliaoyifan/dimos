@@ -123,12 +123,16 @@ When navigation fails or the robot stops making progress:
   is stuck for several seconds it will auto-escape without agent intervention.
 """
 
+# ── Simulation prompt prefix (empty string for real-world) ────────────
+_sim_prefix = cfg.simulation.vlm_prompt_prefix if cfg.simulation.enabled else ""
+
 # ── Skills (conditionally include TTS) ───────────────────────────────
 _skill_blueprints = [
     NavigationSkillContainer.blueprint(
         vlm_backend=cfg.vlm.backend,
         vlm_base_url=cfg.vlm.base_url,
         vlm_model_name=cfg.vlm.model_name,
+        vlm_prompt_prefix=_sim_prefix,
     ),
     PersonFollowSkillContainer.blueprint(camera_info=GO2Connection.camera_info_static),
     UnitreeSkillContainer.blueprint(),
@@ -144,6 +148,7 @@ _escape_blueprint = EscapeSkillContainer.blueprint(
     vlm_backend=cfg.vlm.backend,
     vlm_base_url=cfg.vlm.base_url,
     enable_vlm_check=True,
+    vlm_prompt_prefix=_sim_prefix,
     stuck_time_window=cfg.escape.stuck_time_window,
     stuck_distance_threshold=cfg.escape.stuck_distance_threshold,
     escape_backup_distance=cfg.escape.escape_backup_distance,
@@ -178,6 +183,7 @@ _all_components = [
         vlm_backend=cfg.vlm.backend,
         vlm_base_url=cfg.vlm.base_url,
         vlm_model_name=cfg.vlm.model_name,
+        vlm_prompt_prefix=_sim_prefix,
         vlm_check_interval=cfg.search.vlm_check_interval,
         search_timeout=cfg.search.search_timeout,
         approach_timeout=cfg.search.approach_timeout,

@@ -30,7 +30,7 @@ search:
 # ── NavDP (diffusion-policy navigation) ────────────────────────────
 # Set enabled: true if NavDP inference server is running
 navdp:
-  enabled: false
+  enabled: true
   navdp_server_url: http://192.168.2.109:8880
   vlm_server_url: http://192.168.2.109:8000
 
@@ -47,3 +47,18 @@ escape:
 blueprint:
   enable_tts: false
   n_workers: 8
+
+# ── Simulation ──────────────────────────────────────────────────────
+# Set enabled: true when running in simulation (dimos --simulation)
+# The vlm_prompt_prefix is prepended to EVERY VLM query to help the model
+# understand that images are 3D-rendered, not real photos.
+simulation:
+  enabled: true
+  vlm_prompt_prefix: >-
+    IMPORTANT: This image is from a 3D simulation, NOT a real camera.
+    The scene uses simple 3D-rendered graphics with flat shading, basic
+    geometry, and minimal textures. Objects may look like low-poly 3D
+    models (e.g. a desk is a simple rectangular shape, chairs are basic
+    shapes). Interpret objects by their SHAPE and POSITION, not by
+    photorealistic appearance. A rectangular shape on legs is likely a
+    desk or table. A shape with a seat and backrest is a chair.
