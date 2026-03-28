@@ -261,9 +261,13 @@ def run_diagnostics(config_path: str | None = None) -> dict:
             from navdp_bridge.navdp_client import NavDPClient
             import numpy as np
 
-            intrinsic = np.array([[460, 0, 320], [0, 460, 240], [0, 0, 1]], dtype=np.float32)
-            client = NavDPClient(server_url=cfg.navdp.navdp_server_url, cam_intrinsic=intrinsic)
-            client.initialize(reset=False)
+            intrinsic = (
+                np.array(cfg.navdp.cam_intrinsic, dtype=np.float32)
+                if cfg.navdp.cam_intrinsic is not None
+                else np.array([[460, 0, 320], [0, 460, 240], [0, 0, 1]], dtype=np.float32)
+            )
+            client = NavDPClient(url=cfg.navdp.navdp_server_url)
+            client.initialize(intrinsic)
             ok("NavDPClient.initialize() succeeded")
             results["passed"] += 1
 
