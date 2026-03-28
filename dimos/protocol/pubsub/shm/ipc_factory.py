@@ -263,30 +263,33 @@ class CpuShmChannel(FrameChannel):
 
     def close(self) -> None:
         if getattr(self, "_is_owner", False):
-            try:
-                self._shm_ctrl.close()
-            finally:
+            # Unlink via the original handle so the resource tracker entry for
+            # that handle is removed before close().  Using _safe_unlink() would
+            # create a NEW handle (also tracker-registered), unlink via that,
+            # and leave the original registration dangling → "leaked" warning.
+            for shm in (
+                getattr(self, "_shm_ctrl", None),
+                getattr(self, "_shm_data", None),
+            ):
+                if shm is None:
+                    continue
                 try:
-                    _safe_unlink(self._shm_ctrl.name)
-                except:
+                    shm.unlink()  # unregisters from resource_tracker + removes OS segment
+                except Exception:
                     pass
-            if hasattr(self, "_shm_data"):
                 try:
-                    self._shm_data.close()
-                finally:
-                    try:
-                        _safe_unlink(self._shm_data.name)
-                    except:
-                        pass
+                    shm.close()
+                except Exception:
+                    pass
             return
-        # readers: just close handles
+        # readers: just close handles (unregistered at open time via _unregister)
         try:
             self._shm_ctrl.close()
-        except:
+        except Exception:
             pass
         try:
             self._shm_data.close()
-        except:
+        except Exception:
             pass
 
 
