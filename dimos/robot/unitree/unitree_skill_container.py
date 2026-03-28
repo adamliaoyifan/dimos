@@ -193,10 +193,10 @@ class UnitreeSkillContainer(Module):
     """Container for Unitree Go2 robot skills using the new framework."""
 
     rpc_calls: list[str] = [
-        "NavigationInterface.set_goal",
-        "NavigationInterface.get_state",
-        "NavigationInterface.is_goal_reached",
-        "NavigationInterface.cancel_goal",
+        "ReplanningAStarPlanner.set_goal",
+        "ReplanningAStarPlanner.get_state",
+        "ReplanningAStarPlanner.is_goal_reached",
+        "ReplanningAStarPlanner.cancel_goal",
         "GO2Connection.publish_request",
     ]
 
@@ -238,9 +238,9 @@ class UnitreeSkillContainer(Module):
 
         try:
             set_goal_rpc, get_state_rpc, is_goal_reached_rpc = self.get_rpc_calls(
-                "NavigationInterface.set_goal",
-                "NavigationInterface.get_state",
-                "NavigationInterface.is_goal_reached",
+                "ReplanningAStarPlanner.set_goal",
+                "ReplanningAStarPlanner.get_state",
+                "ReplanningAStarPlanner.is_goal_reached",
             )
         except Exception:
             logger.error("Navigation module not connected properly")

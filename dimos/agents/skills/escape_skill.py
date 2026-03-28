@@ -92,9 +92,9 @@ class EscapeSkillContainer(Module[EscapeConfig]):
     default_config = EscapeConfig
 
     rpc_calls: list[str] = [
-        "NavigationInterface.set_goal",
-        "NavigationInterface.get_state",
-        "NavigationInterface.cancel_goal",
+        "ReplanningAStarPlanner.set_goal",
+        "ReplanningAStarPlanner.get_state",
+        "ReplanningAStarPlanner.cancel_goal",
     ]
 
     color_image: In[Image]
@@ -240,7 +240,7 @@ class EscapeSkillContainer(Module[EscapeConfig]):
         try:
             # Step 1: Cancel current navigation goal
             try:
-                cancel_rpc = self.get_rpc_calls("NavigationInterface.cancel_goal")
+                cancel_rpc = self.get_rpc_calls("ReplanningAStarPlanner.cancel_goal")
                 cancel_rpc()
             except Exception:
                 pass
@@ -263,7 +263,7 @@ class EscapeSkillContainer(Module[EscapeConfig]):
             logger.info(f"[Escape] Backing up {backup_dist}m")
 
             try:
-                set_goal_rpc = self.get_rpc_calls("NavigationInterface.set_goal")
+                set_goal_rpc = self.get_rpc_calls("ReplanningAStarPlanner.set_goal")
                 if self._latest_odom:
                     # Compute a goal point behind the robot
                     q = self._latest_odom.orientation
@@ -327,7 +327,7 @@ class EscapeSkillContainer(Module[EscapeConfig]):
                 continue
 
             try:
-                get_state_rpc = self.get_rpc_calls("NavigationInterface.get_state")
+                get_state_rpc = self.get_rpc_calls("ReplanningAStarPlanner.get_state")
                 from dimos.navigation.base import NavigationState
                 state = get_state_rpc()
                 if state == NavigationState.IDLE:
@@ -343,7 +343,7 @@ class EscapeSkillContainer(Module[EscapeConfig]):
                         self.config.max_escape_attempts,
                     )
                     try:
-                        cancel_rpc = self.get_rpc_calls("NavigationInterface.cancel_goal")
+                        cancel_rpc = self.get_rpc_calls("ReplanningAStarPlanner.cancel_goal")
                         cancel_rpc()
                     except Exception:
                         pass

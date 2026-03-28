@@ -21,9 +21,10 @@ from dimos.agents.annotation import skill
 from dimos.core.core import rpc
 from dimos.core.module import Module
 from dimos.core.stream import In
-from dimos.msgs.geometry_msgs import PoseStamped, Quaternion, Vector3
-from dimos.msgs.geometry_msgs.Vector3 import make_vector3
-from dimos.msgs.sensor_msgs import Image
+from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
+from dimos.msgs.geometry_msgs.Quaternion import Quaternion
+from dimos.msgs.geometry_msgs.Vector3 import Vector3, make_vector3
+from dimos.msgs.sensor_msgs.Image import Image
 
 logger = logging.getLogger(__name__)
 
@@ -44,13 +45,15 @@ class NavDPSkillContainer(Module):
     odom: In[PoseStamped]
 
     rpc_calls: list[str] = [
-        # NavDPNavigator (implements NavigationInterface)
-        "NavigationInterface.set_goal",
-        "NavigationInterface.cancel_goal",
-        "NavigationInterface.get_state",
-        "NavigationInterface.is_goal_reached",
+        # NavDPNavigator (implements NavigationInterface — use concrete name to
+        # avoid ambiguity when ReplanningAStarPlanner is also in the blueprint)
+        "NavDPNavigator.set_goal",
+        "NavDPNavigator.cancel_goal",
+        "NavDPNavigator.get_state",
+        "NavDPNavigator.is_goal_reached",
         # NavDPNavigator extras
         "NavDPNavigator.set_language_goal",
+        "NavDPNavigator.set_reference_image",
         "NavDPNavigator.get_language_goal",
         "NavDPNavigator.get_navdp_state",
         # NavDPMemory
@@ -67,10 +70,10 @@ class NavDPSkillContainer(Module):
     _latest_odom: PoseStamped | None
     _started: bool
 
-    def __init__(self) -> None:
+    def __init__(self, **kwargs: Any) -> None:
         self._latest_odom = None
         self._started = False
-        super().__init__()
+        super().__init__(**kwargs)
 
     @rpc
     def start(self) -> None:
@@ -135,7 +138,7 @@ class NavDPSkillContainer(Module):
                     frame_id="map",
                 )
                 set_goal_rpc = self.get_rpc_calls(
-                    "NavigationInterface.set_goal"
+                    "NavDPNavigator.set_goal"
                 )
                 set_goal_rpc(pose)
                 return (
@@ -158,7 +161,7 @@ class NavDPSkillContainer(Module):
                     frame_id="map",
                 )
                 set_goal_rpc = self.get_rpc_calls(
-                    "NavigationInterface.set_goal"
+                    "NavDPNavigator.set_goal"
                 )
                 set_goal_rpc(pose)
                 return (
@@ -330,7 +333,7 @@ class NavDPSkillContainer(Module):
             return "Error: NavDP skills not started yet."
 
         try:
-            cancel_rpc = self.get_rpc_calls("NavigationInterface.cancel_goal")
+            cancel_rpc = self.get_rpc_calls("NavDPNavigator.cancel_goal")
             cancel_rpc()
         except Exception:
             return "Error: Navigator not connected."
@@ -382,7 +385,7 @@ class NavDPSkillContainer(Module):
 
         try:
             nav_state_rpc = self.get_rpc_calls(
-                "NavigationInterface.get_state"
+                "NavDPNavigator.get_state"
             )
             nav_state = nav_state_rpc().value
         except Exception:

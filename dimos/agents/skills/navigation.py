@@ -60,10 +60,10 @@ class NavigationSkillContainer(Module[NavigationSkillConfig]):
         "SpatialMemory.tag_location",
         "SpatialMemory.query_tagged_location",
         "SpatialMemory.query_by_text",
-        "NavigationInterface.set_goal",
-        "NavigationInterface.get_state",
-        "NavigationInterface.is_goal_reached",
-        "NavigationInterface.cancel_goal",
+        "ReplanningAStarPlanner.set_goal",
+        "ReplanningAStarPlanner.get_state",
+        "ReplanningAStarPlanner.is_goal_reached",
+        "ReplanningAStarPlanner.cancel_goal",
         "ObjectTracking.track",
         "ObjectTracking.stop_track",
         "ObjectTracking.is_tracking",
@@ -203,7 +203,7 @@ class NavigationSkillContainer(Module[NavigationSkillConfig]):
 
     def _navigate_to(self, pose: PoseStamped, message: str) -> str:
         try:
-            set_goal_rpc = self.get_rpc_calls("NavigationInterface.set_goal")
+            set_goal_rpc = self.get_rpc_calls("ReplanningAStarPlanner.set_goal")
         except Exception:
             logger.error("Navigation module not connected properly")
             return "Error: Navigation module is not connected, cannot set goal."
@@ -238,7 +238,7 @@ class NavigationSkillContainer(Module[NavigationSkillConfig]):
 
         try:
             get_state_rpc, is_goal_reached_rpc = self.get_rpc_calls(
-                "NavigationInterface.get_state", "NavigationInterface.is_goal_reached"
+                "ReplanningAStarPlanner.get_state", "ReplanningAStarPlanner.is_goal_reached"
             )
         except Exception:
             logger.error("Navigation module not connected properly")
@@ -323,7 +323,7 @@ class NavigationSkillContainer(Module[NavigationSkillConfig]):
 
     def _cancel_goal_and_stop(self) -> None:
         try:
-            cancel_goal_rpc = self.get_rpc_calls("NavigationInterface.cancel_goal")
+            cancel_goal_rpc = self.get_rpc_calls("ReplanningAStarPlanner.cancel_goal")
         except Exception:
             logger.warning("Navigation module not connected, cannot cancel goal")
             return
