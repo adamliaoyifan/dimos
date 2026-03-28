@@ -35,7 +35,7 @@ from __future__ import annotations
 
 from dimos.core.blueprints import autoconnect
 from dimos.core.transport import pSHMTransport
-from dimos.msgs.sensor_msgs import Image
+from dimos.msgs.sensor_msgs.Image import Image
 
 from dimos.navigation.navdp.navigator import navdp_navigator
 from dimos.navigation.navdp.memory import navdp_memory

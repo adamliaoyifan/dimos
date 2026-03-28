@@ -39,8 +39,8 @@ from reactivex.disposable import Disposable
 from dimos.core.core import rpc
 from dimos.core.module import Module
 from dimos.core.stream import In, Out
-from dimos.msgs.geometry_msgs import PoseStamped
-from dimos.msgs.sensor_msgs import Image
+from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
+from dimos.msgs.sensor_msgs.Image import Image
 from dimos.msgs.sensor_msgs.Image import ImageFormat
 
 logger = logging.getLogger(__name__)
@@ -170,6 +170,13 @@ class NavDPMemory(Module):
         revisit_uncertainty_thresh: float = 0.96,
         auto_save_interval_s: float = 60.0,
         debug_log_dir: str | None = None,
+        # LandmarkManager parameters
+        landmark_enabled: bool = True,
+        keyframe_dir: str = "",
+        scene_sim_thresh: float = 0.85,
+        landmark_min_interval_s: float = 2.0,
+        landmark_time_thresh_s: float = 5.0,
+        **kwargs: Any,
     ) -> None:
         self._vlm_url = vlm_server_url
         self._embedding_url = embedding_server_url
@@ -179,6 +186,11 @@ class NavDPMemory(Module):
         self._revisit_sim_thresh = revisit_sim_thresh
         self._uncertainty_thresh = revisit_uncertainty_thresh
         self._auto_save_interval = auto_save_interval_s
+        self._landmark_enabled = landmark_enabled
+        self._keyframe_dir = keyframe_dir
+        self._scene_sim_thresh = scene_sim_thresh
+        self._landmark_min_interval_s = landmark_min_interval_s
+        self._landmark_time_thresh_s = landmark_time_thresh_s
 
         # Debug logging
         self._session_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -207,21 +219,36 @@ class NavDPMemory(Module):
     @rpc
     def start(self) -> None:
         super().start()
-        _ensure_imports()
+        try:
+            _ensure_imports()
+        except ImportError:
+            logger.error(
+                "NavDPMemory disabled — navdp_bridge not installed. "
+                "Add NavDP's ros2_ws/src/navdp_bridge to PYTHONPATH."
+            )
+            return
         nb = _nb
 
         self._spatial_memory = nb["SpatialMemory"]()
         self._vlm_client = nb["VLMClient"](
             vlm_url=self._vlm_url, logger=logger
         )
+        keyframe_dir = self._keyframe_dir or os.path.join(
+            self._memory_base_dir, "keyframes"
+        )
         self._landmark_manager = nb["LandmarkManager"](
+            enabled=self._landmark_enabled,
+            keyframe_dir=keyframe_dir,
+            scene_sim_thresh=self._scene_sim_thresh,
+            min_interval_s=self._landmark_min_interval_s,
+            time_thresh_s=self._landmark_time_thresh_s,
             vlm_client=self._vlm_client,
+            logger=logger,
             revisit_sim_thresh=self._revisit_sim_thresh,
             revisit_uncertainty_thresh=self._uncertainty_thresh,
             embedding_model=self._embedding_model,
             embedding_server_url=self._embedding_url,
             memory_base_dir=self._memory_base_dir,
-            logger=logger,
         )
 
         # --- Debug logging ---

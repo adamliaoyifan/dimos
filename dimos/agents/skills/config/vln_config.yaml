@@ -33,6 +33,26 @@ navdp:
   enabled: true
   navdp_server_url: http://192.168.2.109:8880
   vlm_server_url: http://192.168.2.109:8000
+  # 3x3 camera intrinsic matrix — REQUIRED for real robot deployment.
+  # Rows: [fx, 0, cx], [0, fy, cy], [0, 0, 1]
+  # Omit or set to null to use the built-in default (fx=fy=460, cx=320, cy=240).
+  cam_intrinsic:
+    - [460.0, 0.0, 320.0]
+    - [0.0, 460.0, 240.0]
+    - [0.0, 0.0, 1.0]
+  # Camera extrinsics: position of camera in base_link frame (metres, radians)
+  # Defaults below match Unitree Go2 from NavDP bridge_params.yaml.
+  cam_x: 0.13      # forward offset from base centre
+  cam_y: 0.00      # lateral offset (positive = left)
+  cam_z: 0.30      # height above ground
+  cam_pitch: 0.157  # downward tilt in radians (~9°)
+  # Trajectory controller tuning (matched to bridge defaults)
+  mpc_horizon: 15
+  mpc_desired_v: 0.3
+  mpc_v_max: 0.3
+  mpc_w_max: 0.5
+  mpc_ref_gap: 3
+  goal_lookahead_m: 1.5
 
 # ── Escape / stuck recovery ───────────────────────────────────────
 escape:

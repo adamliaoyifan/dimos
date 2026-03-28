@@ -56,6 +56,28 @@ class NavDPConfig:
     enabled: bool = False
     navdp_server_url: str = "http://192.168.2.109:8880"
     vlm_server_url: str = "http://192.168.2.109:8000"
+    # 3x3 camera intrinsic matrix as nested list [[fx,0,cx],[0,fy,cy],[0,0,1]].
+    # If None, NavDPNavigator uses a built-in default (fx=fy=460, cx=320, cy=240).
+    cam_intrinsic: list[list[float]] | None = None
+    # Camera extrinsics: position of camera origin in base_link frame (metres/rad)
+    # Defaults match Unitree Go2 from NavDP bridge_params.yaml
+    cam_x: float = 0.13
+    cam_y: float = 0.00
+    cam_z: float = 0.30
+    cam_pitch: float = 0.157  # ~9° downward tilt
+    # Trajectory controller / MPC tuning
+    mpc_horizon: int = 15
+    mpc_desired_v: float = 0.3
+    mpc_v_max: float = 0.3
+    mpc_w_max: float = 0.5
+    mpc_ref_gap: int = 3
+    goal_lookahead_m: float = 1.5
+    # Landmark manager tuning
+    landmark_enabled: bool = True
+    keyframe_dir: str = ""
+    scene_sim_thresh: float = 0.85
+    landmark_min_interval_s: float = 2.0
+    landmark_time_thresh_s: float = 5.0
 
 
 @dataclass
