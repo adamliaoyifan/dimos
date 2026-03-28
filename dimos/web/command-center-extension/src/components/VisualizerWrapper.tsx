@@ -78,7 +78,7 @@ const VisualizerWrapper: React.FC<VisualizerWrapperProps> = ({ data, onWorldClic
 
   return (
     <div ref={containerRef} style={{ width: "100%", height: "100%" }} onClick={handleClick}>
-      <VisualizerComponent costmap={data.costmap} robotPose={data.robotPose} path={data.path} />
+      <VisualizerComponent costmap={data.costmap} robotPose={data.robotPose} path={data.path} navdpPath={data.navdpPath} />
     </div>
   );
 };

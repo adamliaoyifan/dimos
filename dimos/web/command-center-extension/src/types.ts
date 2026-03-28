@@ -95,6 +95,7 @@ export interface FullStateData {
   gps_location?: LatLon;
   gps_travel_goal_points?: LatLon[];
   path?: EncodedPath;
+  navdp_path?: EncodedPath;
 }
 
 export interface TwistCommand {
@@ -116,6 +117,7 @@ export interface AppState {
   gpsLocation: LatLon | null;
   gpsTravelGoalPoints: LatLon[] | null;
   path: Path | null;
+  navdpPath: Path | null;
 }
 
 export type AppAction =
@@ -124,4 +126,5 @@ export type AppAction =
   | { type: "SET_GPS_LOCATION"; payload: LatLon }
   | { type: "SET_GPS_TRAVEL_GOAL_POINTS"; payload: LatLon[] }
   | { type: "SET_PATH"; payload: Path }
+  | { type: "SET_NAVDP_PATH"; payload: Path }
   | { type: "SET_FULL_STATE"; payload: Partial<AppState> };

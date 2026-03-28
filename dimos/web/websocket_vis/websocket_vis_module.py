@@ -96,6 +96,7 @@ class WebsocketVisModule(Module[WebsocketConfig]):
     odom: In[PoseStamped]
     gps_location: In[LatLon]
     path: In[Path]
+    navdp_path: In[Path]
     global_costmap: In[OccupancyGrid]
 
     # LCM outputs
@@ -185,6 +186,12 @@ class WebsocketVisModule(Module[WebsocketConfig]):
 
         try:
             unsub = self.path.subscribe(self._on_path)
+            self._disposables.add(Disposable(unsub))
+        except Exception:
+            ...
+
+        try:
+            unsub = self.navdp_path.subscribe(self._on_navdp_path)
             self._disposables.add(Disposable(unsub))
         except Exception:
             ...
@@ -374,9 +381,15 @@ class WebsocketVisModule(Module[WebsocketConfig]):
 
     def _on_path(self, msg: Path) -> None:
         points = [[pose.position.x, pose.position.y] for pose in msg.poses]
-        path_data = {"type": "path", "points": points}
+        path_data = {"type": "path", "points": points, "method": "astar"}
         self.vis_state["path"] = path_data
         self._emit("path", path_data)
+
+    def _on_navdp_path(self, msg: Path) -> None:
+        points = [[pose.position.x, pose.position.y] for pose in msg.poses]
+        navdp_data = {"type": "path", "points": points, "method": "navdp"}
+        self.vis_state["navdp_path"] = navdp_data
+        self._emit("navdp_path", navdp_data)
 
     def _on_global_costmap(self, msg: OccupancyGrid) -> None:
         costmap_data = self._process_costmap(msg)

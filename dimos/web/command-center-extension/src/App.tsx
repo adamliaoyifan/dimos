@@ -21,6 +21,8 @@ function appReducer(state: AppState, action: AppAction): AppState {
       return { ...state, gpsTravelGoalPoints: action.payload };
     case "SET_PATH":
       return { ...state, path: action.payload };
+    case "SET_NAVDP_PATH":
+      return { ...state, navdpPath: action.payload };
     case "SET_FULL_STATE":
       return { ...state, ...action.payload };
     default:
@@ -34,6 +36,7 @@ const initialState: AppState = {
   gpsLocation: null,
   gpsTravelGoalPoints: null,
   path: null,
+  navdpPath: null,
 };
 
 export default function App(): React.ReactElement {

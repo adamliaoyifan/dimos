@@ -44,6 +44,11 @@ export default class Connection {
       this.dispatch({ type: "SET_PATH", payload: path });
     });
 
+    this.socket.on("navdp_path", (data: EncodedPath) => {
+      const path = Path.decode(data);
+      this.dispatch({ type: "SET_NAVDP_PATH", payload: path });
+    });
+
     this.socket.on("full_state", (data: FullStateData) => {
       const state: Partial<{ costmap: Costmap; robotPose: Vector; gpsLocation: LatLon; gpsTravelGoalPoints: LatLon[]; path: Path }> = {};
 
@@ -58,6 +63,9 @@ export default class Connection {
       }
       if (data.path != undefined) {
         state.path = Path.decode(data.path);
+      }
+      if (data.navdp_path != undefined) {
+        state.navdpPath = Path.decode(data.navdp_path);
       }
 
       this.dispatch({ type: "SET_FULL_STATE", payload: state });

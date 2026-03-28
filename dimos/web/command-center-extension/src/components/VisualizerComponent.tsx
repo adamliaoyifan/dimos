@@ -10,9 +10,10 @@ interface VisualizerComponentProps {
   costmap: Costmap | null;
   robotPose: Vector | null;
   path: Path | null;
+  navdpPath: Path | null;
 }
 
-const VisualizerComponent: React.FC<VisualizerComponentProps> = ({ costmap, robotPose, path }) => {
+const VisualizerComponent: React.FC<VisualizerComponentProps> = ({ costmap, robotPose, path, navdpPath }) => {
   const svgRef = React.useRef<SVGSVGElement>(null);
   const [dimensions, setDimensions] = React.useState({ width: 800, height: 600 });
   const { width, height } = dimensions;
@@ -90,7 +91,8 @@ const VisualizerComponent: React.FC<VisualizerComponentProps> = ({ costmap, robo
         }}
       >
         {costmap && <CostmapLayer costmap={costmap} width={width} height={height} />}
-        {path && worldToPx && <PathLayer path={path} worldToPx={worldToPx} />}
+        {path && worldToPx && <PathLayer path={path} worldToPx={worldToPx} color="#ff3333" label="A*" />}
+        {navdpPath && worldToPx && <PathLayer path={navdpPath} worldToPx={worldToPx} color="#00e5ff" label="NavDP" />}
         {robotPose && worldToPx && (
           <VectorLayer vector={robotPose} label="robot" worldToPx={worldToPx} />
         )}
