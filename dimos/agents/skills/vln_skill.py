@@ -95,16 +95,21 @@ class VLNSkillContainer(Module[VLNConfig]):
     default_config = VLNConfig
 
     rpc_calls: list[str] = [
-        "NavigationInterface.set_goal",
-        "NavigationInterface.get_state",
-        "NavigationInterface.is_goal_reached",
-        "NavigationInterface.cancel_goal",
+        "ReplanningAStarPlanner.set_goal",
+        "ReplanningAStarPlanner.get_state",
+        "ReplanningAStarPlanner.is_goal_reached",
+        "ReplanningAStarPlanner.cancel_goal",
         "WavefrontFrontierExplorer.explore",
         "WavefrontFrontierExplorer.stop_exploration",
         "WavefrontFrontierExplorer.is_exploration_active",
         "SpatialMemory.query_by_text",
         "SpatialMemory.tag_location",
         "SpatialMemory.query_tagged_location",
+        # NavDP (optional — used for imagegoal approach when available)
+        "NavDPNavigator.set_language_goal",
+        "NavDPNavigator.set_reference_image",
+        "NavDPNavigator.get_navdp_state",
+        "NavDPNavigator.cancel_goal",
     ]
 
     color_image: In[Image]
@@ -279,7 +284,7 @@ class VLNSkillContainer(Module[VLNConfig]):
         )
 
         try:
-            set_goal_rpc = self.get_rpc_calls("NavigationInterface.set_goal")
+            set_goal_rpc = self.get_rpc_calls("ReplanningAStarPlanner.set_goal")
         except Exception:
             return False
 
@@ -289,7 +294,7 @@ class VLNSkillContainer(Module[VLNConfig]):
         """Block until navigation finishes or timeout. Returns True if goal reached."""
         try:
             get_state_rpc, is_reached_rpc = self.get_rpc_calls(
-                "NavigationInterface.get_state", "NavigationInterface.is_goal_reached"
+                "ReplanningAStarPlanner.get_state", "ReplanningAStarPlanner.is_goal_reached"
             )
         except Exception:
             return False
@@ -319,43 +324,131 @@ class VLNSkillContainer(Module[VLNConfig]):
         except Exception:
             return False
 
-    def _approach_object(self, bbox: BBox, object_description: str = "") -> str:
-        """Approach a detected object by walking forward while keeping it in view.
+    def _has_navdp(self) -> bool:
+        """Check if NavDPNavigator is available and active."""
+        try:
+            state_rpc = self.get_rpc_calls("NavDPNavigator.get_navdp_state")
+            state = state_rpc()
+            return state != "UNINITIALIZED"
+        except Exception:
+            return False
 
-        Uses a simple VLM-guided loop: move forward in small increments,
-        re-check each time whether the object is still visible and growing
-        (i.e. getting closer).  Does NOT require the ObjectTracking module.
+    def _approach_via_navdp(self, object_description: str) -> str:
+        """Approach using NavDP imagegoal mode.
+
+        Sends the current camera frame as a reference image to NavDP,
+        which transitions to APPROACH state and uses imagegoal_step
+        to navigate toward the object.
+        """
+        import cv2
+
+        if self._latest_image is None:
+            return "Error: no image available for NavDP approach."
+
+        # Get reference image (current frame where the object was detected)
+        ref_bgr = self._latest_image.data
+        from dimos.msgs.sensor_msgs.Image import ImageFormat
+        if self._latest_image.format == ImageFormat.RGB:
+            ref_bgr = cv2.cvtColor(ref_bgr, cv2.COLOR_RGB2BGR)
+
+        try:
+            set_ref_rpc = self.get_rpc_calls("NavDPNavigator.set_reference_image")
+            set_ref_rpc(ref_bgr)
+        except Exception:
+            logger.warning("[VLN] Failed to set NavDP reference image, falling back to A*")
+            return ""  # empty = signal to fall back
+
+        # Also set the language goal so VLM detection can track
+        try:
+            set_lang_rpc = self.get_rpc_calls("NavDPNavigator.set_language_goal")
+            set_lang_rpc(object_description)
+        except Exception:
+            pass
+
+        logger.info("[VLN] NavDP APPROACH started for '%s'", object_description)
+
+        # Wait for NavDP to reach STOPPED or timeout
+        start_time = time.time()
+        while time.time() - start_time < self.config.approach_timeout:
+            if self._search_stop.is_set():
+                try:
+                    cancel_rpc = self.get_rpc_calls("NavDPNavigator.cancel_goal")
+                    cancel_rpc()
+                except Exception:
+                    pass
+                return "Search was cancelled."
+
+            try:
+                state_rpc = self.get_rpc_calls("NavDPNavigator.get_navdp_state")
+                navdp_state = state_rpc()
+            except Exception:
+                navdp_state = "unknown"
+
+            if navdp_state == "STOPPED":
+                logger.info("[VLN] NavDP APPROACH complete → STOPPED")
+                return "Successfully approached the object via NavDP imagegoal."
+
+            if navdp_state == "IDLE":
+                logger.info("[VLN] NavDP returned to IDLE during approach")
+                return "NavDP approach ended (goal may have been reached)."
+
+            time.sleep(0.5)
+
+        # Timeout — cancel NavDP
+        try:
+            cancel_rpc = self.get_rpc_calls("NavDPNavigator.cancel_goal")
+            cancel_rpc()
+        except Exception:
+            pass
+        return "NavDP approach timed out. The robot is near the object."
+
+    def _approach_via_astar(self, bbox: BBox, object_description: str = "") -> str:
+        """Fallback approach using A* planner small steps.
+
+        Used when NavDP is not available.
         """
         import math
 
         try:
-            set_goal_rpc = self.get_rpc_calls("NavigationInterface.set_goal")
+            set_goal_rpc, cancel_goal_rpc = self.get_rpc_calls(
+                "ReplanningAStarPlanner.set_goal",
+                "ReplanningAStarPlanner.cancel_goal",
+            )
         except Exception:
             return "Error: NavigationInterface not connected for approach."
 
         if self._latest_odom is None:
             return "Error: no odometry available for approach."
 
-        step_distance = 0.4  # meters per step
-        max_steps = int(self.config.approach_timeout / 3)  # ~3s per step
+        # Cancel any existing goal before starting approach
+        try:
+            cancel_goal_rpc()
+        except Exception:
+            pass
+
+        step_distance = 0.3  # meters per step (smaller for more control)
+        max_steps = int(self.config.approach_timeout / 4)  # ~4s per step
+        lost_retries = 0
+        max_lost_retries = 3
 
         for step in range(max_steps):
             if self._search_stop.is_set():
                 return "Search was cancelled."
 
-            # Compute a goal one step ahead in the robot's facing direction
             q = self._latest_odom.orientation
             siny = 2.0 * (q.w * q.z + q.x * q.y)
             cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
             yaw = math.atan2(siny, cosy)
 
-            # Steer toward the bbox centre: if object is left/right of image
-            # centre, bias the yaw slightly
+            # Steer toward the bbox centre
             if bbox and self._latest_image is not None:
                 img_w = self._latest_image.data.shape[1]
                 bbox_cx = (bbox[0] + bbox[2]) / 2.0
+                # Normalize bbox coords if they appear to be in 0-1000 scale
+                if bbox[2] > img_w:
+                    bbox_cx = bbox_cx / 1000.0 * img_w
                 offset_ratio = (bbox_cx - img_w / 2.0) / (img_w / 2.0)
-                yaw += offset_ratio * 0.3  # up to ~17° steering correction
+                yaw += offset_ratio * 0.5
 
             goal_x = self._latest_odom.position.x + step_distance * math.cos(yaw)
             goal_y = self._latest_odom.position.y + step_distance * math.sin(yaw)
@@ -366,28 +459,75 @@ class VLNSkillContainer(Module[VLNConfig]):
                 frame_id="map",
             )
             set_goal_rpc(goal)
+            logger.info(
+                "[VLN] A* approach step %d: moving %.2fm toward (%.2f, %.2f), yaw=%.1f°",
+                step + 1, step_distance, goal_x, goal_y, math.degrees(yaw),
+            )
 
-            # Wait for the step to complete
-            self._wait_for_navigation(timeout=5.0)
+            self._wait_for_navigation(timeout=6.0)
 
-            # Re-check: is the object still visible (and larger → closer)?
             new_bbox = self._check_object_in_view(object_description)
             if new_bbox:
+                lost_retries = 0
                 new_area = (new_bbox[2] - new_bbox[0]) * (new_bbox[3] - new_bbox[1])
-                old_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
                 bbox = new_bbox
-                # Object fills >40% of the image → close enough
                 if self._latest_image is not None:
                     img_h, img_w = self._latest_image.data.shape[:2]
+                    # Normalize bbox area if coords are in 0-1000 scale
+                    if new_bbox[2] > img_w or new_bbox[3] > img_h:
+                        scale_x = img_w / 1000.0
+                        scale_y = img_h / 1000.0
+                        new_area = (
+                            (new_bbox[2] - new_bbox[0]) * scale_x
+                            * (new_bbox[3] - new_bbox[1]) * scale_y
+                        )
                     fill_ratio = new_area / (img_w * img_h)
-                    if fill_ratio > 0.40:
+                    logger.info("[VLN] Object still in view, fill_ratio=%.2f", fill_ratio)
+                    if fill_ratio > 0.30:
+                        try:
+                            cancel_goal_rpc()
+                        except Exception:
+                            pass
                         return "Successfully approached the object."
             else:
-                # Lost sight — one more step forward then stop
-                logger.info("[VLN] Lost object from view during approach, stopping")
-                return "Object was visible but lost during approach. The robot is near the last sighting."
+                lost_retries += 1
+                logger.info(
+                    "[VLN] Lost object from view during approach (attempt %d/%d)",
+                    lost_retries, max_lost_retries,
+                )
+                if lost_retries >= max_lost_retries:
+                    try:
+                        cancel_goal_rpc()
+                    except Exception:
+                        pass
+                    return "Object was visible but lost during approach. The robot is near the last sighting."
+                time.sleep(1.0)
 
+        try:
+            cancel_goal_rpc()
+        except Exception:
+            pass
         return "Approach complete (max steps reached). The robot is near the object."
+
+    def _approach_object(self, bbox: BBox, object_description: str = "") -> str:
+        """Approach a detected object. Uses NavDP imagegoal if available, else A*.
+
+        When NavDP is active, the current camera frame (containing the detected
+        object) is sent as a reference image, and NavDP's diffusion policy
+        drives toward it using imagegoal_step. This is more robust than A*
+        step-by-step approach because the policy handles obstacle avoidance
+        and visual servoing natively.
+        """
+        # Try NavDP imagegoal approach first
+        if self._has_navdp():
+            logger.info("[VLN] Using NavDP imagegoal for approach")
+            result = self._approach_via_navdp(object_description)
+            if result:  # non-empty = NavDP handled it
+                return result
+            logger.info("[VLN] NavDP approach failed, falling back to A*")
+
+        # Fallback to A* step-by-step approach
+        return self._approach_via_astar(bbox, object_description)
 
     # ------------------------------------------------------------------
     # Cancel helper
@@ -398,8 +538,14 @@ class VLNSkillContainer(Module[VLNConfig]):
             self._search_stop.set()
             self._stop_exploration()
             try:
-                cancel_rpc = self.get_rpc_calls("NavigationInterface.cancel_goal")
+                cancel_rpc = self.get_rpc_calls("ReplanningAStarPlanner.cancel_goal")
                 cancel_rpc()
+            except Exception:
+                pass
+            # Also cancel NavDP goal if active
+            try:
+                navdp_cancel = self.get_rpc_calls("NavDPNavigator.cancel_goal")
+                navdp_cancel()
             except Exception:
                 pass
             if (
@@ -509,8 +655,27 @@ class VLNSkillContainer(Module[VLNConfig]):
             if bbox:
                 logger.info(f"[VLN] Found '{obj}' during exploration!")
                 self._stop_exploration()
-                result = self._approach_object(bbox, obj)
-                return f"Found '{obj}' during exploration. {result}"
+                # Cancel any lingering A* planner goal from the frontier explorer
+                try:
+                    cancel_rpc = self.get_rpc_calls("ReplanningAStarPlanner.cancel_goal")
+                    cancel_rpc()
+                except Exception:
+                    pass
+                # Let the robot settle before starting approach
+                time.sleep(1.0)
+                # Re-check object visibility after settling
+                bbox = self._check_object_in_view(obj)
+                if not bbox:
+                    logger.info(f"[VLN] Object '{obj}' lost after exploration stop, re-checking...")
+                    time.sleep(1.0)
+                    bbox = self._check_object_in_view(obj)
+                if bbox:
+                    result = self._approach_object(bbox, obj)
+                    return f"Found '{obj}' during exploration. {result}"
+                else:
+                    logger.info(f"[VLN] Object '{obj}' lost after exploration stop, resuming search")
+                    self._start_exploration()
+                    continue
 
             time.sleep(self.config.vlm_check_interval)
 

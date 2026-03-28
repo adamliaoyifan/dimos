@@ -159,15 +159,48 @@ _escape_blueprint = EscapeSkillContainer.blueprint(
 # ── Optional NavDP (diffusion-policy) skills ─────────────────────────
 _navdp_blueprints = []
 if cfg.navdp.enabled:
-    from dimos.navigation.navdp.navigator import NavDPNavigator
-    from dimos.navigation.navdp.skills import NavDPSkillContainer
+    import numpy as np
+    from dimos.core.blueprints import autoconnect as _autoconnect
+    from dimos.core.transport import pSHMTransport
+    from dimos.msgs.sensor_msgs.Image import Image
+    from dimos.navigation.navdp import navdp_navigator, navdp_memory, navdp_skills
+
+    _cam_intrinsic = (
+        np.array(cfg.navdp.cam_intrinsic, dtype=np.float32)
+        if cfg.navdp.cam_intrinsic is not None
+        else None
+    )
 
     _navdp_blueprints = [
-        NavDPNavigator.blueprint(
-            navdp_server_url=cfg.navdp.navdp_server_url,
-            vlm_server_url=cfg.navdp.vlm_server_url,
-        ),
-        NavDPSkillContainer.blueprint(),
+        _autoconnect(
+            navdp_navigator(
+                navdp_server_url=cfg.navdp.navdp_server_url,
+                vlm_server_url=cfg.navdp.vlm_server_url,
+                cam_intrinsic=_cam_intrinsic,
+                cam_x=cfg.navdp.cam_x,
+                cam_y=cfg.navdp.cam_y,
+                cam_z=cfg.navdp.cam_z,
+                cam_pitch=cfg.navdp.cam_pitch,
+                mpc_horizon=cfg.navdp.mpc_horizon,
+                mpc_desired_v=cfg.navdp.mpc_desired_v,
+                mpc_v_max=cfg.navdp.mpc_v_max,
+                mpc_w_max=cfg.navdp.mpc_w_max,
+                mpc_ref_gap=cfg.navdp.mpc_ref_gap,
+                goal_lookahead_m=cfg.navdp.goal_lookahead_m,
+            ),
+            navdp_memory(
+                vlm_server_url=cfg.navdp.vlm_server_url,
+                landmark_enabled=cfg.navdp.landmark_enabled,
+                keyframe_dir=cfg.navdp.keyframe_dir,
+                scene_sim_thresh=cfg.navdp.scene_sim_thresh,
+                landmark_min_interval_s=cfg.navdp.landmark_min_interval_s,
+                landmark_time_thresh_s=cfg.navdp.landmark_time_thresh_s,
+            ),
+            navdp_skills(),
+        ).transports({
+            ("color_image", Image): pSHMTransport("color_image"),
+            ("topdown_map", Image): pSHMTransport("topdown_map"),
+        })
     ]
 
 # ── Compose blueprint ────────────────────────────────────────────────
