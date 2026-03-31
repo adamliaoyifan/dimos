@@ -66,7 +66,7 @@ def _static_base_link(rr: Any) -> list[Any]:
         rr.Boxes3D(
             half_sizes=[0.35, 0.155, 0.2],
             colors=[(0, 255, 127)],
-            fill_mode="wireframe",
+            fill_mode="MajorWireframe",
         ),
         rr.Transform3D(parent_frame="tf#/base_link"),
     ]
