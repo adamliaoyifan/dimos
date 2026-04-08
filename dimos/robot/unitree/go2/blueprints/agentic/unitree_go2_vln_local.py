@@ -162,13 +162,32 @@ if cfg.navdp.enabled:
     import numpy as np
     from dimos.core.blueprints import autoconnect as _autoconnect
     from dimos.core.transport import pSHMTransport
+    from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
+    from dimos.msgs.geometry_msgs.Twist import Twist
     from dimos.msgs.sensor_msgs.Image import Image
     from dimos.navigation.navdp import navdp_navigator, navdp_memory, navdp_skills
 
+    # Resolve the active camera profile for trajectory inference.
+    _traj_cam = cfg.navdp.get_trajectory_camera()
     _cam_intrinsic = (
-        np.array(cfg.navdp.cam_intrinsic, dtype=np.float32)
-        if cfg.navdp.cam_intrinsic is not None
+        np.array(_traj_cam.intrinsic, dtype=np.float32)
+        if _traj_cam.intrinsic is not None
         else None
+    )
+
+    # In real deployment with a separate RealSense, wire the navigator's
+    # navdp_image / navdp_depth streams to the RealSense transport channels
+    # so trajectory inference uses the depth camera and VLM keeps the Go2 camera.
+    #
+    # In simulation (or any single-camera setup) both stream names resolve to
+    # the same pSHM channel, so the navigator transparently falls back to
+    # color_image / depth_image for inference.
+    _is_realsense = cfg.navdp.trajectory_camera == "realsense_d435"
+    _navdp_image_transport = (
+        pSHMTransport("realsense_image") if _is_realsense else pSHMTransport("color_image")
+    )
+    _navdp_depth_transport = (
+        pSHMTransport("realsense_depth") if _is_realsense else pSHMTransport("depth_image")
     )
 
     _navdp_blueprints = [
@@ -177,16 +196,25 @@ if cfg.navdp.enabled:
                 navdp_server_url=cfg.navdp.navdp_server_url,
                 vlm_server_url=cfg.navdp.vlm_server_url,
                 cam_intrinsic=_cam_intrinsic,
-                cam_x=cfg.navdp.cam_x,
-                cam_y=cfg.navdp.cam_y,
-                cam_z=cfg.navdp.cam_z,
-                cam_pitch=cfg.navdp.cam_pitch,
+                cam_x=_traj_cam.x,
+                cam_y=_traj_cam.y,
+                cam_z=_traj_cam.z,
+                cam_pitch=_traj_cam.pitch,
                 mpc_horizon=cfg.navdp.mpc_horizon,
                 mpc_desired_v=cfg.navdp.mpc_desired_v,
                 mpc_v_max=cfg.navdp.mpc_v_max,
                 mpc_w_max=cfg.navdp.mpc_w_max,
                 mpc_ref_gap=cfg.navdp.mpc_ref_gap,
                 goal_lookahead_m=cfg.navdp.goal_lookahead_m,
+                hold_duration_s=cfg.navdp.hold_duration_s,
+                decel_duration_s=cfg.navdp.decel_duration_s,
+                enable_internal_vlm=cfg.navdp.enable_internal_vlm,
+                trajectory_selector_enabled=cfg.navdp.trajectory_selector.enabled,
+                trajectory_selector_kwargs={
+                    k: v
+                    for k, v in vars(cfg.navdp.trajectory_selector).items()
+                    if k != "enabled"
+                },
             ),
             navdp_memory(
                 vlm_server_url=cfg.navdp.vlm_server_url,
@@ -199,7 +227,12 @@ if cfg.navdp.enabled:
             navdp_skills(),
         ).transports({
             ("color_image", Image): pSHMTransport("color_image"),
+            ("navdp_image", Image): _navdp_image_transport,
+            ("depth_image", Image): pSHMTransport("depth_image"),
+            ("navdp_depth", Image): _navdp_depth_transport,
             ("topdown_map", Image): pSHMTransport("topdown_map"),
+            ("odom", PoseStamped): pSHMTransport("odom"),
+            ("cmd_vel", Twist): pSHMTransport("cmd_vel"),
         })
     ]
 
@@ -221,6 +254,7 @@ _all_components = [
         search_timeout=cfg.search.search_timeout,
         approach_timeout=cfg.search.approach_timeout,
         similarity_threshold=cfg.search.similarity_threshold,
+        exploration_mode=cfg.search.exploration_mode,
     ),
 ]
 
