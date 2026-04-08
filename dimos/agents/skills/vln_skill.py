@@ -90,6 +90,11 @@ class VLNConfig(ModuleConfig):
     confirm_check_delay: float = 1.5
     """Seconds to wait between VLM checks during confirmation (ensures fresh camera frame)."""
 
+    max_overrun_m: float = 1.5
+    """Maximum distance (metres) the robot may travel past the detection capture pose
+    before it navigates back to the capture point before confirmation.
+    Set to 0 to always navigate back; set large to skip the back-up."""
+
 
 class VLNSkillContainer(Module[VLNConfig]):
     """Vision-and-Language Navigation skill for compound goals.
