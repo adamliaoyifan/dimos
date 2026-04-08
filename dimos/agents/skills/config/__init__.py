@@ -49,6 +49,63 @@ class SearchConfig:
     search_timeout: float = 120.0
     approach_timeout: float = 30.0
     similarity_threshold: float = 0.23
+    exploration_mode: str = "astar"
+    """Exploration backend: "astar" (WavefrontFrontier + A*) or "navdp" (diffusion-policy nogoal)."""
+    confirm_checks: int = 3
+    confirm_threshold: int = 2
+    confirm_rotate_deg: float = 20.0
+    confirm_check_delay: float = 1.5
+    max_overrun_m: float = 0.5
+    """When the robot has moved more than this distance since the VLM image
+    was captured (due to VLM latency), navigate back to the capture pose
+    before attempting to confirm the detection."""
+
+
+@dataclass
+class TrajectorySelectorConfig:
+    enabled: bool = False
+    cost_threshold: int = 100
+    unknown_penalty: float = 0.8
+    critic_weight: float = 1.0
+    costmap_weight: float = 0.1
+    collision_penalty: float = 1000.0
+    robot_length: float = 0.6
+    robot_half_width: float = 0.15
+    robot_radius: float = 0.30  # backward-compat: circumscribing radius
+    horizon_m: float = 1.5
+    sample_step: int = 2
+    max_trajectory_cost: float = 50.0
+    explore_weight: float = 5.0
+    explore_radius: float = 2.0
+    explore_endpoint_bonus: float = 1.0
+    depth_obstacle_m: float = 0.5
+
+
+@dataclass
+class CameraConfig:
+    """Intrinsic and extrinsic parameters for a single camera.
+
+    intrinsic is the 3x3 camera matrix as a nested list::
+
+        [[fx, 0, cx],
+         [0, fy, cy],
+         [0,  0,  1]]
+
+    Extrinsics describe where the camera origin sits in the robot's
+    base_link frame (metres / radians).  pitch is positive-downward tilt.
+    """
+
+    # Intrinsic — if None the NavDPNavigator falls back to its built-in default
+    intrinsic: list[list[float]] | None = None
+    # Extrinsic (translation in base_link frame)
+    x: float = 0.13
+    y: float = 0.00
+    z: float = 0.30
+    pitch: float = 0.157  # ~9° downward tilt
+    # Image geometry
+    width: int = 640
+    height: int = 480
+    fps: int = 30
 
 
 @dataclass
@@ -56,15 +113,19 @@ class NavDPConfig:
     enabled: bool = False
     navdp_server_url: str = "http://192.168.2.109:8880"
     vlm_server_url: str = "http://192.168.2.109:8000"
-    # 3x3 camera intrinsic matrix as nested list [[fx,0,cx],[0,fy,cy],[0,0,1]].
-    # If None, NavDPNavigator uses a built-in default (fx=fy=460, cx=320, cy=240).
-    cam_intrinsic: list[list[float]] | None = None
-    # Camera extrinsics: position of camera origin in base_link frame (metres/rad)
-    # Defaults match Unitree Go2 from NavDP bridge_params.yaml
-    cam_x: float = 0.13
-    cam_y: float = 0.00
-    cam_z: float = 0.30
-    cam_pitch: float = 0.157  # ~9° downward tilt
+    # Active camera profile name.  Must be a key in ``cameras`` below.
+    # "go2"           — built-in Go2 camera (sim + real VLM/VLN)
+    # "realsense_d435" — RealSense D435 for real-deployment NavDP trajectories
+    trajectory_camera: str = "go2"
+    # Named camera profiles.  Loaded from the ``cameras:`` YAML section.
+    # Each entry is a CameraConfig.  The active profile is selected by
+    # ``trajectory_camera`` above.
+    cameras: dict[str, CameraConfig] = field(default_factory=dict)
+    # Graceful network-failure parameters
+    hold_duration_s: float = 0.3
+    decel_duration_s: float = 0.5
+    # VLM control: set False in VLN blueprint so VLNSkillContainer owns all VLM
+    enable_internal_vlm: bool = True
     # Trajectory controller / MPC tuning
     mpc_horizon: int = 15
     mpc_desired_v: float = 0.3
@@ -78,6 +139,14 @@ class NavDPConfig:
     scene_sim_thresh: float = 0.85
     landmark_min_interval_s: float = 2.0
     landmark_time_thresh_s: float = 5.0
+    # Trajectory selector
+    trajectory_selector: TrajectorySelectorConfig = field(
+        default_factory=TrajectorySelectorConfig
+    )
+
+    def get_trajectory_camera(self) -> CameraConfig:
+        """Return the active trajectory camera profile, or a sensible default."""
+        return self.cameras.get(self.trajectory_camera, CameraConfig())
 
 
 @dataclass
@@ -121,6 +190,26 @@ class VLNTestConfig:
     simulation: SimulationConfig = field(default_factory=SimulationConfig)
 
 
+def _parse_navdp_config(raw: dict[str, Any]) -> NavDPConfig:
+    """Parse navdp section handling nested trajectory_selector and cameras dicts."""
+    raw = dict(raw)  # shallow copy so we don't mutate the caller's dict
+    ts_raw = raw.pop("trajectory_selector", {})
+    cameras_raw: dict[str, Any] = raw.pop("cameras", {})
+
+    navdp = NavDPConfig(**raw)
+
+    if ts_raw:
+        navdp.trajectory_selector = TrajectorySelectorConfig(**ts_raw)
+
+    # Parse each camera profile entry into a CameraConfig
+    navdp.cameras = {
+        name: CameraConfig(**cam_raw)
+        for name, cam_raw in cameras_raw.items()
+    }
+
+    return navdp
+
+
 def load_vln_config(path: str | Path | None = None) -> VLNTestConfig:
     """Load VLN configuration from a YAML file.
 
@@ -143,7 +232,7 @@ def load_vln_config(path: str | Path | None = None) -> VLNTestConfig:
         vlm=VLMConfig(**raw.get("vlm", {})),
         agent=AgentConfig(**raw.get("agent", {})),
         search=SearchConfig(**raw.get("search", {})),
-        navdp=NavDPConfig(**raw.get("navdp", {})),
+        navdp=_parse_navdp_config(raw.get("navdp", {})),
         escape=EscapeConfig(**raw.get("escape", {})),
         blueprint=BlueprintConfig(**raw.get("blueprint", {})),
         simulation=SimulationConfig(**raw.get("simulation", {})),
@@ -156,6 +245,8 @@ __all__ = [
     "AgentConfig",
     "SearchConfig",
     "NavDPConfig",
+    "CameraConfig",
+    "TrajectorySelectorConfig",
     "EscapeConfig",
     "BlueprintConfig",
     "SimulationConfig",
