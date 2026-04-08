@@ -22,6 +22,8 @@ The frontend is served from a separate HTML file.
 """
 
 import asyncio
+import base64
+import io
 from pathlib import Path as FilePath
 import threading
 import time
@@ -29,6 +31,7 @@ from typing import Any
 import webbrowser
 
 from dimos_lcm.std_msgs import Bool  # type: ignore[import-untyped]
+import numpy as np
 from reactivex.disposable import Disposable
 import socketio  # type: ignore[import-untyped]
 from starlette.applications import Starlette
@@ -57,6 +60,7 @@ from dimos.msgs.geometry_msgs.TwistStamped import TwistStamped
 from dimos.msgs.geometry_msgs.Vector3 import Vector3
 from dimos.msgs.nav_msgs.OccupancyGrid import OccupancyGrid
 from dimos.msgs.nav_msgs.Path import Path
+from dimos.msgs.sensor_msgs.Image import Image
 from dimos.utils.logging_config import setup_logger
 
 from .optimized_costmap import OptimizedCostmapEncoder
@@ -98,6 +102,8 @@ class WebsocketVisModule(Module[WebsocketConfig]):
     path: In[Path]
     navdp_path: In[Path]
     global_costmap: In[OccupancyGrid]
+    color_image: In[Image]
+    depth_image: In[Image]
 
     # LCM outputs
     goal_request: Out[PoseStamped]
@@ -125,6 +131,11 @@ class WebsocketVisModule(Module[WebsocketConfig]):
         self.vis_state = {}  # type: ignore[var-annotated]
         self.state_lock = threading.Lock()
         self.costmap_encoder = OptimizedCostmapEncoder(chunk_size=64)
+
+        # Image broadcasting rate limiting (5 Hz max)
+        self._last_color_emit: float = 0.0
+        self._last_depth_emit: float = 0.0
+        self._image_emit_interval: float = 0.2
 
         # Track GPS goal points for visualization
         self.gps_goal_points: list[dict[str, float]] = []
@@ -202,6 +213,18 @@ class WebsocketVisModule(Module[WebsocketConfig]):
         except Exception:
             ...
 
+        try:
+            unsub = self.color_image.subscribe(self._on_color_image)
+            self._disposables.add(Disposable(unsub))
+        except Exception:
+            ...
+
+        try:
+            unsub = self.depth_image.subscribe(self._on_depth_image)
+            self._disposables.add(Disposable(unsub))
+        except Exception:
+            ...
+
     @rpc
     def stop(self) -> None:
         if getattr(self, "_ws_stopped", False):
@@ -260,9 +283,14 @@ class WebsocketVisModule(Module[WebsocketConfig]):
                     media_type="text/plain",
                 )
 
+        async def serve_debug_images(request):  # type: ignore[no-untyped-def]
+            """Serve the debug images page for color + depth visualization."""
+            return Response(content=_DEBUG_IMAGES_HTML, media_type="text/html")
+
         routes = [
             Route("/", serve_index),
             Route("/command-center", serve_command_center),
+            Route("/debug-images", serve_debug_images),
         ]
 
         starlette_app = Starlette(routes=routes)
@@ -412,6 +440,124 @@ class WebsocketVisModule(Module[WebsocketConfig]):
             "origin_theta": 0,  # Assuming no rotation for now
         }
 
+    def _on_color_image(self, msg: Image) -> None:
+        now = time.time()
+        if now - self._last_color_emit < self._image_emit_interval:
+            return
+        self._last_color_emit = now
+        b64 = self._image_to_base64(msg)
+        if b64:
+            self._emit("debug_color_image", b64)
+
+    def _on_depth_image(self, msg: Image) -> None:
+        now = time.time()
+        if now - self._last_depth_emit < self._image_emit_interval:
+            return
+        self._last_depth_emit = now
+        b64 = self._image_to_base64(msg, is_depth=True)
+        if b64:
+            self._emit("debug_depth_image", b64)
+
+    @staticmethod
+    def _image_to_base64(img: Image, is_depth: bool = False) -> str | None:
+        """Encode a DimOS Image to a base64 JPEG string."""
+        try:
+            import cv2
+
+            arr = img.data
+            if arr is None or arr.size == 0:
+                return None
+
+            if is_depth:
+                # Normalize depth to 0-255 for visualization
+                if arr.dtype != np.uint8:
+                    valid = arr[arr > 0] if np.any(arr > 0) else arr.ravel()
+                    vmin, vmax = float(valid.min()), float(valid.max())
+                    if vmax - vmin < 1e-6:
+                        arr_vis = np.zeros_like(arr, dtype=np.uint8)
+                    else:
+                        arr_vis = ((arr - vmin) / (vmax - vmin) * 255).clip(0, 255).astype(np.uint8)
+                else:
+                    arr_vis = arr
+                # Apply colormap for better depth visualization
+                arr_vis = cv2.applyColorMap(arr_vis, cv2.COLORMAP_TURBO)
+            else:
+                arr_vis = arr
+                # Convert RGB to BGR for cv2 encoding if needed
+                if arr_vis.ndim == 3 and arr_vis.shape[2] == 3:
+                    arr_vis = cv2.cvtColor(arr_vis, cv2.COLOR_RGB2BGR)
+
+            _, buf = cv2.imencode(".jpg", arr_vis, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            return base64.b64encode(buf.tobytes()).decode("ascii")
+        except Exception:
+            return None
+
     def _emit(self, event: str, data: Any) -> None:
         if self._broadcast_loop and not self._broadcast_loop.is_closed():
             asyncio.run_coroutine_threadsafe(self.sio.emit(event, data), self._broadcast_loop)
+
+
+# ---------------------------------------------------------------------------
+# Inline HTML for /debug-images page
+# ---------------------------------------------------------------------------
+_DEBUG_IMAGES_HTML = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>NavDP Debug Images</title>
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #1a1a2e; color: #e0e0e0; font-family: system-ui, sans-serif; padding: 16px; }
+  h1 { font-size: 1.4rem; margin-bottom: 12px; color: #7ec8e3; }
+  .grid { display: flex; gap: 16px; flex-wrap: wrap; }
+  .panel { flex: 1; min-width: 320px; }
+  .panel h2 { font-size: 1rem; margin-bottom: 8px; color: #ccc; }
+  .panel img { width: 100%; border: 1px solid #333; border-radius: 4px; background: #111; }
+  .status { font-size: 0.85rem; color: #888; margin-top: 4px; }
+</style>
+</head>
+<body>
+<h1>NavDP Debug Images</h1>
+<div class="grid">
+  <div class="panel">
+    <h2>Color Image</h2>
+    <img id="color" alt="waiting for color image..." />
+    <div class="status" id="color-status">Waiting...</div>
+  </div>
+  <div class="panel">
+    <h2>Depth Image</h2>
+    <img id="depth" alt="waiting for depth image..." />
+    <div class="status" id="depth-status">Waiting...</div>
+  </div>
+</div>
+<script>
+  const socket = io({ transports: ['websocket', 'polling'] });
+  let colorCount = 0, depthCount = 0;
+
+  socket.on('connect', () => {
+    document.getElementById('color-status').textContent = 'Connected, waiting for frames...';
+    document.getElementById('depth-status').textContent = 'Connected, waiting for frames...';
+  });
+
+  socket.on('debug_color_image', (b64) => {
+    colorCount++;
+    document.getElementById('color').src = 'data:image/jpeg;base64,' + b64;
+    document.getElementById('color-status').textContent = 'Frame #' + colorCount;
+  });
+
+  socket.on('debug_depth_image', (b64) => {
+    depthCount++;
+    document.getElementById('depth').src = 'data:image/jpeg;base64,' + b64;
+    document.getElementById('depth-status').textContent = 'Frame #' + depthCount;
+  });
+
+  socket.on('disconnect', () => {
+    document.getElementById('color-status').textContent = 'Disconnected';
+    document.getElementById('depth-status').textContent = 'Disconnected';
+  });
+</script>
+</body>
+</html>
+"""
