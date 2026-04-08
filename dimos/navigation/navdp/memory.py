@@ -587,6 +587,22 @@ class NavDPMemory(Module):
         return {"x": node.odom_x, "y": node.odom_y, "yaw": node.odom_yaw}
 
     @rpc
+    def get_all_node_positions(self) -> list[list[float]]:
+        """Return (x, y) positions of every PlaceNode in the spatial memory.
+
+        Intended for the trajectory selector's exploration cost: the navigator
+        can periodically pull these positions to supplement its odom trail with
+        semantically meaningful landmarks.
+
+        Returns a list of ``[odom_x, odom_y]`` pairs (world frame, metres).
+        """
+        if self._spatial_memory is None:
+            return []
+        return [
+            [n.odom_x, n.odom_y] for n in self._spatial_memory.nodes
+        ]
+
+    @rpc
     def get_memory_summary(self) -> dict[str, Any]:
         """Get a summary of the current spatial memory state."""
         if self._spatial_memory is None:
