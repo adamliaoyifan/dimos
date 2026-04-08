@@ -113,6 +113,8 @@ def _run_simulation(config: GlobalConfig, shm: ShmReader) -> None:
 
         # Create renderers
         rgb_renderer = mujoco.Renderer(model, height=camera_size[1], width=camera_size[0])
+        head_depth_renderer = mujoco.Renderer(model, height=camera_size[1], width=camera_size[0])
+        head_depth_renderer.enable_depth_rendering()
         depth_renderer = mujoco.Renderer(model, height=camera_size[1], width=camera_size[0])
         depth_renderer.enable_depth_rendering()
 
@@ -153,11 +155,21 @@ def _run_simulation(config: GlobalConfig, shm: ShmReader) -> None:
 
             current_time = time.time()
 
-            # Video rendering
+            # Video rendering (RGB + aligned head-camera depth)
             if current_time - last_video_time >= video_interval:
                 rgb_renderer.update_scene(data, camera=camera_id, scene_option=scene_option)
                 pixels = rgb_renderer.render()
                 shm.write_video(pixels)
+
+                # Render depth from the same head_camera for NavDP consumption.
+                # MuJoCo >= 3.x render() already returns linear metric depth
+                # (metres), so no z-buffer linearization is needed.
+                head_depth_renderer.update_scene(data, camera=camera_id, scene_option=scene_option)
+                head_depth_metric = head_depth_renderer.render().astype(np.float32)
+                # Clip to 10m max (RealSense-like range)
+                head_depth_metric = np.clip(head_depth_metric, 0.0, 10.0)
+                shm.write_head_depth(head_depth_metric)
+
                 last_video_time = current_time
 
             # Lidar/depth rendering

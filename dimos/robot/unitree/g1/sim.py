@@ -51,6 +51,7 @@ class G1SimConnection(G1ConnectionBase[G1SimConfig]):
     lidar: Out[PointCloud2]
     odom: Out[PoseStamped]
     color_image: Out[Image]
+    depth_image: Out[Image]
     camera_info: Out[CameraInfo]
     connection: MujocoConnection | None = None
     _camera_info_thread: Thread | None = None
@@ -73,6 +74,7 @@ class G1SimConnection(G1ConnectionBase[G1SimConfig]):
         self._disposables.add(self.connection.odom_stream().subscribe(self._publish_sim_odom))
         self._disposables.add(self.connection.lidar_stream().subscribe(self.lidar.publish))
         self._disposables.add(self.connection.video_stream().subscribe(self.color_image.publish))
+        self._disposables.add(self.connection.depth_stream().subscribe(self.depth_image.publish))
 
         self._camera_info_thread = Thread(
             target=self._publish_camera_info_loop,

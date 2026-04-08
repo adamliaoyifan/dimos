@@ -85,6 +85,7 @@ class MujocoConnection:
         self._last_video_seq = 0
         self._last_odom_seq = 0
         self._last_lidar_seq = 0
+        self._last_depth_seq = 0
         self._stop_timer: threading.Timer | None = None
 
         self._stream_threads: list[threading.Thread] = []
@@ -227,6 +228,7 @@ class MujocoConnection:
         self.lidar_stream.cache_clear()
         self.odom_stream.cache_clear()
         self.video_stream.cache_clear()
+        self.depth_stream.cache_clear()
 
     def standup(self) -> bool:
         return True
@@ -269,6 +271,18 @@ class MujocoConnection:
                 ts=timestamp,
                 frame_id="world",
             )
+
+        return None
+
+    def get_depth_frame(self) -> NDArray[Any] | None:
+        """Read the latest head-camera depth frame (float32, metres)."""
+        if self.shm_data is None:
+            return None
+
+        frame, seq = self.shm_data.read_head_depth()
+        if seq > self._last_depth_seq:
+            self._last_depth_seq = seq
+            return frame
 
         return None
 
@@ -336,6 +350,15 @@ class MujocoConnection:
             return Image.from_numpy(frame, format=ImageFormat.RGB) if frame is not None else None
 
         return self._create_stream(get_video_as_image, VIDEO_FPS, "Video")
+
+    @functools.cache
+    def depth_stream(self) -> Observable[Image]:
+        """Stream of head-camera depth images (float32, metres) as ``Image``."""
+        def get_depth_as_image() -> Image | None:
+            frame = self.get_depth_frame()
+            return Image.from_numpy(frame, format=ImageFormat.DEPTH) if frame is not None else None
+
+        return self._create_stream(get_depth_as_image, VIDEO_FPS, "Depth")
 
     def move(self, twist: Twist, duration: float = 0.0) -> bool:
         if self._is_cleaned_up or self.shm_data is None:

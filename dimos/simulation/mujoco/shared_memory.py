@@ -47,6 +47,7 @@ _shm_sizes = {
     "depth_front": _depth_size,
     "depth_left": _depth_size,
     "depth_right": _depth_size,
+    "head_depth": _depth_size,
     "odom": _odom_size,
     "cmd": _cmd_size,
     "lidar": _lidar_size,
@@ -70,6 +71,7 @@ class ShmSet:
     depth_front: SharedMemory
     depth_left: SharedMemory
     depth_right: SharedMemory
+    head_depth: SharedMemory
     odom: SharedMemory
     cmd: SharedMemory
     lidar: SharedMemory
@@ -139,6 +141,13 @@ class ShmReader:
         depth_array[:] = right
 
         self._increment_seq(1)
+
+    def write_head_depth(self, depth: NDArray[Any]) -> None:
+        depth_array: NDArray[Any] = np.ndarray(
+            (VIDEO_HEIGHT, VIDEO_WIDTH), dtype=np.float32, buffer=self.shm.head_depth.buf
+        )
+        depth_array[:] = depth
+        self._increment_seq(5)
 
     def write_odom(self, pos: NDArray[Any], quat: NDArray[Any], timestamp: float) -> None:
         odom_array: NDArray[Any] = np.ndarray((8,), dtype=np.float64, buffer=self.shm.odom.buf)
@@ -233,6 +242,15 @@ class ShmWriter:
             quat = odom_array[3:7].copy()
             timestamp = odom_array[7]
             return (pos, quat, timestamp), seq
+        return None, 0
+
+    def read_head_depth(self) -> tuple[NDArray[Any] | None, int]:
+        seq = self._get_seq(5)
+        if seq > 0:
+            depth_array: NDArray[Any] = np.ndarray(
+                (VIDEO_HEIGHT, VIDEO_WIDTH), dtype=np.float32, buffer=self.shm.head_depth.buf
+            )
+            return depth_array.copy(), seq
         return None, 0
 
     def write_command(self, linear: NDArray[Any], angular: NDArray[Any]) -> None:

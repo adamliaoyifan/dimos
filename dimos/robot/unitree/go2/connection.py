@@ -191,6 +191,7 @@ class GO2Connection(Module[_Config], Camera, Pointcloud):
     odom: Out[PoseStamped]
     lidar: Out[PointCloud2]
     color_image: Out[Image]
+    depth_image: Out[Image]
     camera_info: Out[CameraInfo]
 
     connection: Go2ConnectionProtocol
@@ -241,6 +242,12 @@ class GO2Connection(Module[_Config], Camera, Pointcloud):
         self._disposables.add(self.connection.odom_stream().subscribe(self._publish_tf))
         self._disposables.add(self.connection.video_stream().subscribe(onimage))
         self._disposables.add(Disposable(self.cmd_vel.subscribe(self.move)))
+
+        # Depth stream is only available from MuJoCo simulation
+        if hasattr(self.connection, "depth_stream"):
+            self._disposables.add(
+                self.connection.depth_stream().subscribe(self.depth_image.publish)
+            )
 
         self._camera_info_thread = Thread(
             target=self.publish_camera_info,
