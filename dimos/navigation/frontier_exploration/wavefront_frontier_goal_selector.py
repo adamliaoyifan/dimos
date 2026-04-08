@@ -725,6 +725,9 @@ class WavefrontFrontierExplorer(Module[WavefrontConfig]):
         self.exploration_active = False
         self.no_gain_counter = 0  # Reset counter when exploration stops
         self.stop_event.set()
+        # Unblock the goal_reached_event.wait() so the exploration thread
+        # can exit promptly instead of waiting up to goal_timeout seconds.
+        self.goal_reached_event.set()
 
         # Only join if we're NOT being called from the exploration thread itself
         if (
@@ -732,7 +735,7 @@ class WavefrontFrontierExplorer(Module[WavefrontConfig]):
             and self.exploration_thread.is_alive()
             and threading.current_thread() != self.exploration_thread
         ):
-            self.exploration_thread.join(timeout=2.0)
+            self.exploration_thread.join(timeout=5.0)
 
         # Publish current location as goal to stop the robot.
         if self.latest_odometry is not None:
@@ -773,6 +776,11 @@ class WavefrontFrontierExplorer(Module[WavefrontConfig]):
             costmap = simple_inflate(self.latest_costmap, 0.25)
             goal = self.get_exploration_goal(robot_pose, costmap)
 
+            # Re-check stop flag after potentially long computation
+            if self.stop_event.is_set() or not self.exploration_active:
+                logger.info("Exploration stopped during goal computation, discarding result.")
+                break
+
             if goal:
                 # Publish goal to navigator
                 goal_msg = PoseStamped()
@@ -795,6 +803,11 @@ class WavefrontFrontierExplorer(Module[WavefrontConfig]):
                 # Wait for goal to be reached or timeout
                 logger.info("Waiting for goal to be reached...")
                 goal_reached = self.goal_reached_event.wait(timeout=self.config.goal_timeout)
+
+                # Re-check stop flag after waiting
+                if self.stop_event.is_set() or not self.exploration_active:
+                    logger.info("Exploration stopped while waiting for goal.")
+                    break
 
                 if goal_reached:
                     logger.info("Goal reached, finding next frontier")
