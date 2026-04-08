@@ -22,6 +22,7 @@ checking.
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from typing import Any
@@ -59,6 +60,10 @@ class VLNConfig(ModuleConfig):
     similarity_threshold: float = 0.23
     """Minimum CLIP similarity for semantic map queries."""
 
+    exploration_mode: str = "astar"
+    """Exploration backend: "astar" (WavefrontFrontier + A*) or "navdp" (diffusion-policy nogoal).
+    Use "navdp" to test the NavDP server in isolation."""
+
     vlm_backend: str = "qwen3_local"
     """VLM backend: 'qwen3_local' (custom Qwen3 server), 'qwen_local' (OpenAI-compat),
     'qwen' (Alibaba API), or 'moondream' (local HF)."""
@@ -71,6 +76,19 @@ class VLNConfig(ModuleConfig):
 
     vlm_prompt_prefix: str = ""
     """Prefix prepended to every VLM prompt (e.g. simulation context)."""
+
+    confirm_checks: int = 3
+    """Number of VLM checks per heading during detection confirmation."""
+
+    confirm_threshold: int = 2
+    """Minimum detections out of confirm_checks required to confirm the object."""
+
+    confirm_rotate_deg: float = 20.0
+    """Degrees to rotate between confirmation checks (full 360 scan if needed).
+    Should be less than the camera horizontal FOV (~38° for Go2) to avoid gaps."""
+
+    confirm_check_delay: float = 1.5
+    """Seconds to wait between VLM checks during confirmation (ensures fresh camera frame)."""
 
 
 class VLNSkillContainer(Module[VLNConfig]):
@@ -110,6 +128,8 @@ class VLNSkillContainer(Module[VLNConfig]):
         "NavDPNavigator.set_reference_image",
         "NavDPNavigator.get_navdp_state",
         "NavDPNavigator.cancel_goal",
+        # In-place rotation during detection confirmation (uses A* planner, collision-safe)
+        "UnitreeSkillContainer.relative_move",
     ]
 
     color_image: In[Image]
@@ -161,6 +181,10 @@ class VLNSkillContainer(Module[VLNConfig]):
         self._disposables.add(Disposable(self.color_image.subscribe(self._on_image)))
         self._disposables.add(Disposable(self.odom.subscribe(self._on_odom)))
         self._started = True
+        logger.info(
+            "[VLN] started — exploration_mode=%s, vlm=%s",
+            self.config.exploration_mode, self.config.vlm_backend,
+        )
 
     @rpc
     def stop(self) -> None:
@@ -245,13 +269,91 @@ class VLNSkillContainer(Module[VLNConfig]):
     # Object detection via VLM
     # ------------------------------------------------------------------
 
-    def _check_object_in_view(self, object_description: str) -> BBox | None:
-        """Check if the target object is visible in the current frame."""
+    def _check_object_in_view(
+        self, object_description: str
+    ) -> tuple["BBox | None", "PoseStamped | None"]:
+        """Check if the target object is visible in the current frame.
+
+        Returns (bbox, capture_odom) where capture_odom is the robot pose at
+        the moment the image was captured (before the blocking VLM call).
+        Callers can compare capture_odom to the current odom to detect overrun.
+        """
         if self._latest_image is None:
-            return None
-        return get_object_bbox_from_image(
-            self._vl_model, self._latest_image, object_description
+            return None, None
+        # Snapshot odom at capture time — BEFORE the blocking VLM call
+        capture_odom = self._latest_odom
+        t0 = time.time()
+        try:
+            result = get_object_bbox_from_image(
+                self._vl_model, self._latest_image, object_description
+            )
+        except Exception as exc:
+            elapsed_ms = (time.time() - t0) * 1000
+            logger.info("[VLN] VLM check '%s': EXCEPTION after %.0fms — %s", object_description, elapsed_ms, exc)
+            return None, capture_odom
+        elapsed_ms = (time.time() - t0) * 1000
+        # Log current position (at result time) for diagnostics
+        _pos = (round(self._latest_odom.position.x, 2), round(self._latest_odom.position.y, 2)) if self._latest_odom else None
+        _cap_pos = (round(capture_odom.position.x, 2), round(capture_odom.position.y, 2)) if capture_odom else None
+        logger.info(
+            "[VLN] VLM check '%s': %s (%.0fms) pos=%s cap_pos=%s",
+            object_description,
+            f"FOUND bbox={result}" if result else "not found",
+            elapsed_ms,
+            _pos,
+            _cap_pos,
         )
+        return result, capture_odom
+
+    def _compute_overrun(self, capture_odom: "PoseStamped | None") -> float:
+        """Euclidean distance between the current odom and where the image was captured."""
+        if capture_odom is None or self._latest_odom is None:
+            return 0.0
+        dx = self._latest_odom.position.x - capture_odom.position.x
+        dy = self._latest_odom.position.y - capture_odom.position.y
+        return math.sqrt(dx * dx + dy * dy)
+
+    def _navigate_to_capture_pose(self, capture_odom: "PoseStamped | None") -> None:
+        """Drive the robot back to *capture_odom* using ``relative_move``.
+
+        Computes the displacement in the robot's current local frame and
+        issues a single relative_move command.  Waits for the move to
+        complete before returning.
+        """
+        if capture_odom is None or self._latest_odom is None:
+            return
+
+        cur = self._latest_odom
+        dx_world = capture_odom.position.x - cur.position.x
+        dy_world = capture_odom.position.y - cur.position.y
+
+        # Current yaw (from quaternion → Euler)
+        yaw = cur.orientation.to_euler().z
+
+        # Rotate the world-frame displacement into the robot's body frame
+        cos_yaw = math.cos(yaw)
+        sin_yaw = math.sin(yaw)
+        forward = dx_world * cos_yaw + dy_world * sin_yaw
+        left = -dx_world * sin_yaw + dy_world * cos_yaw
+
+        # Heading difference toward the capture pose
+        target_yaw = math.atan2(dy_world, dx_world)
+        delta_deg = math.degrees(target_yaw - yaw)
+        # Normalise to [-180, 180]
+        delta_deg = (delta_deg + 180) % 360 - 180
+
+        logger.info(
+            "[VLN] Navigating back to capture pose: "
+            "forward=%.2f left=%.2f rotate=%.1f deg",
+            forward, left, delta_deg,
+        )
+
+        try:
+            move_rpc = self.get_rpc_calls("UnitreeSkillContainer.relative_move")
+            move_rpc(forward, left, delta_deg)
+            time.sleep(1.0)  # let robot settle
+        except Exception:
+            logger.warning("[VLN] relative_move failed during navigate-back")
 
     # ------------------------------------------------------------------
     # Navigation helpers
@@ -310,6 +412,18 @@ class VLNSkillContainer(Module[VLNConfig]):
         return False
 
     def _start_exploration(self) -> bool:
+        if self.config.exploration_mode == "navdp":
+            return self._start_exploration_navdp()
+        return self._start_exploration_astar()
+
+    def _stop_exploration(self) -> bool:
+        if self.config.exploration_mode == "navdp":
+            return self._stop_exploration_navdp()
+        return self._stop_exploration_astar()
+
+    # -- A* (WavefrontFrontier) exploration --
+
+    def _start_exploration_astar(self) -> bool:
         try:
             explore_rpc = self.get_rpc_calls("WavefrontFrontierExplorer.explore")
             return explore_rpc()
@@ -317,10 +431,38 @@ class VLNSkillContainer(Module[VLNConfig]):
             logger.warning("WavefrontFrontierExplorer not connected")
             return False
 
-    def _stop_exploration(self) -> bool:
+    def _stop_exploration_astar(self) -> bool:
         try:
             stop_rpc = self.get_rpc_calls("WavefrontFrontierExplorer.stop_exploration")
             return stop_rpc()
+        except Exception:
+            return False
+
+    # -- NavDP nogoal exploration --
+
+    def _start_exploration_navdp(self) -> bool:
+        """Start exploration using NavDP nogoal diffusion policy.
+
+        Sets a dummy language goal so NavDP enters SEEK state and runs
+        nogoal_step each tick, generating exploration trajectories purely
+        from the diffusion policy.
+        """
+        try:
+            set_lang_rpc = self.get_rpc_calls("NavDPNavigator.set_language_goal")
+            set_lang_rpc("explore the environment")
+            logger.info("[VLN] NavDP nogoal exploration started")
+            return True
+        except Exception:
+            logger.warning("[VLN] NavDPNavigator not connected, falling back to A*")
+            return self._start_exploration_astar()
+
+    def _stop_exploration_navdp(self) -> bool:
+        """Stop NavDP nogoal exploration."""
+        try:
+            cancel_rpc = self.get_rpc_calls("NavDPNavigator.cancel_goal")
+            cancel_rpc()
+            logger.info("[VLN] NavDP nogoal exploration stopped")
+            return True
         except Exception:
             return False
 
@@ -333,23 +475,63 @@ class VLNSkillContainer(Module[VLNConfig]):
         except Exception:
             return False
 
-    def _approach_via_navdp(self, object_description: str) -> str:
+    def _approach_via_navdp(
+        self, object_description: str, bbox: BBox | None = None
+    ) -> str:
         """Approach using NavDP imagegoal mode.
 
-        Sends the current camera frame as a reference image to NavDP,
-        which transitions to APPROACH state and uses imagegoal_step
-        to navigate toward the object.
+        Sends a cropped reference image (centred on the detected bounding box)
+        to NavDP, which transitions to APPROACH state and uses imagegoal_step
+        to navigate toward the object.  If no bbox is provided the full frame
+        is used as a fallback.
         """
         import cv2
+        import numpy as np
 
         if self._latest_image is None:
             return "Error: no image available for NavDP approach."
+
+        # Ensure A* planner is fully stopped before NavDP takes cmd_vel
+        try:
+            cancel_rpc = self.get_rpc_calls("ReplanningAStarPlanner.cancel_goal")
+            cancel_rpc()
+        except Exception:
+            pass
 
         # Get reference image (current frame where the object was detected)
         ref_bgr = self._latest_image.data
         from dimos.msgs.sensor_msgs.Image import ImageFormat
         if self._latest_image.format == ImageFormat.RGB:
             ref_bgr = cv2.cvtColor(ref_bgr, cv2.COLOR_RGB2BGR)
+
+        # Crop to bounding box with padding so NavDP gets a focused reference
+        if bbox is not None:
+            img_h, img_w = ref_bgr.shape[:2]
+            x1, y1, x2, y2 = bbox
+            # Normalise if coords are in 0-1000 scale
+            if x2 > img_w or y2 > img_h:
+                x1 = int(x1 / 1000.0 * img_w)
+                y1 = int(y1 / 1000.0 * img_h)
+                x2 = int(x2 / 1000.0 * img_w)
+                y2 = int(y2 / 1000.0 * img_h)
+            else:
+                x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+            # Add 20% padding around the crop
+            bw, bh = x2 - x1, y2 - y1
+            pad_x, pad_y = int(bw * 0.2), int(bh * 0.2)
+            x1 = max(0, x1 - pad_x)
+            y1 = max(0, y1 - pad_y)
+            x2 = min(img_w, x2 + pad_x)
+            y2 = min(img_h, y2 + pad_y)
+            if x2 > x1 and y2 > y1:
+                ref_bgr = ref_bgr[y1:y2, x1:x2].copy()
+                logger.info(
+                    "[VLN] Cropped reference image to bbox [%d,%d,%d,%d] "
+                    "(padded) → %dx%d",
+                    x1, y1, x2, y2, ref_bgr.shape[1], ref_bgr.shape[0],
+                )
+            else:
+                logger.warning("[VLN] Invalid bbox after normalisation, using full frame")
 
         try:
             set_ref_rpc = self.get_rpc_calls("NavDPNavigator.set_reference_image")
@@ -466,7 +648,7 @@ class VLNSkillContainer(Module[VLNConfig]):
 
             self._wait_for_navigation(timeout=6.0)
 
-            new_bbox = self._check_object_in_view(object_description)
+            new_bbox, _ = self._check_object_in_view(object_description)
             if new_bbox:
                 lost_retries = 0
                 new_area = (new_bbox[2] - new_bbox[0]) * (new_bbox[3] - new_bbox[1])
@@ -509,19 +691,134 @@ class VLNSkillContainer(Module[VLNConfig]):
             pass
         return "Approach complete (max steps reached). The robot is near the object."
 
+    def _confirm_detection(self, obj: str, initial_bbox: "BBox | None" = None) -> "BBox | None":
+        """Confirm a VLM detection with a majority vote, rotating if needed.
+
+        After the robot stops, pre-aligns toward the initial detection bbox
+        (if provided) so the object is roughly centred before confirmation
+        checks begin.  Then runs VLM ``confirm_checks`` times and requires at
+        least ``confirm_threshold`` positives.  The first heading uses a more
+        lenient threshold (``confirm_threshold - 1``, min 1) because the object
+        was already detected once there during exploration.  If the object is
+        not confirmed at the current heading, rotates by ``confirm_rotate_deg``
+        in place (via ``UnitreeSkillContainer.relative_move``, which uses the
+        A* planner and therefore checks the costmap for collision safety) and
+        tries again.  Continues rotating until a full 360 degrees has been
+        covered.
+
+        Returns the best confirmed bbox, or None if the object was not
+        confirmed after a full rotation scan.
+        """
+        checks = self.config.confirm_checks
+        threshold = self.config.confirm_threshold
+        # First heading gets a lenient threshold since we just detected it there.
+        first_threshold = max(1, threshold - 1)
+        step_deg = self.config.confirm_rotate_deg
+        check_delay = self.config.confirm_check_delay
+        total_rotated = 0.0
+
+        # Pre-align toward the detection so we start confirmation facing the
+        # object.  This is necessary when the detection bbox is near the edge
+        # of the frame (common when the object enters the FOV while the robot
+        # is moving).  Camera HFOV ≈ 38° (fx=460, width=320 from intrinsics).
+        if initial_bbox is not None and self._latest_image is not None:
+            img_w = self._latest_image.data.shape[1]
+            cx = (initial_bbox[0] + initial_bbox[2]) / 2.0
+            if initial_bbox[2] > img_w:  # bbox coords in 0-1000 scale
+                cx = cx / 1000.0 * img_w
+            # Fraction offset from image centre: [-1=far left, +1=far right]
+            offset_ratio = (cx - img_w / 2.0) / (img_w / 2.0)
+            # Camera horizontal half-FOV from intrinsics (fx≈460, width=320)
+            hfov_half_deg = math.degrees(math.atan2(img_w / 2.0, 460.0))
+            align_deg = round(offset_ratio * hfov_half_deg, 1)
+            logger.info(
+                "[VLN] Pre-aligning %.1f deg to centre detection (cx=%.0f/%d, offset=%.2f)",
+                align_deg, cx, img_w, offset_ratio,
+            )
+            if abs(align_deg) > 3.0:
+                try:
+                    move_rpc = self.get_rpc_calls("UnitreeSkillContainer.relative_move")
+                    move_rpc(0.0, 0.0, align_deg)
+                    time.sleep(check_delay)
+                except Exception:
+                    logger.warning("[VLN] relative_move unavailable during pre-alignment")
+
+        while total_rotated < 360.0:
+            if self._search_stop.is_set():
+                return None
+
+            # Log current heading for diagnostics
+            heading_deg: float | str = "unknown"
+            if self._latest_odom is not None:
+                heading_deg = round(
+                    math.degrees(self._latest_odom.orientation.to_euler().z), 1
+                )
+            logger.info(
+                "[VLN] Confirm '%s': heading %.1f deg rotated, yaw=%s, threshold=%d/%d",
+                obj, total_rotated, heading_deg,
+                first_threshold if total_rotated == 0.0 else threshold, checks,
+            )
+
+            # Majority vote: run VLM ``checks`` times at the current heading
+            detections = 0
+            best_bbox = None
+            for check_idx in range(checks):
+                if self._search_stop.is_set():
+                    return None
+                time.sleep(check_delay)  # wait for a fresh camera frame
+                bbox, _ = self._check_object_in_view(obj)
+                found = bbox is not None
+                if found:
+                    detections += 1
+                    best_bbox = bbox
+                logger.info(
+                    "[VLN] Confirm check %d/%d for '%s': %s",
+                    check_idx + 1, checks, obj,
+                    f"FOUND bbox={bbox}" if found else "not found",
+                )
+
+            # Use lenient threshold for the initial (heading-0) check
+            effective_threshold = first_threshold if total_rotated == 0.0 else threshold
+            if detections >= effective_threshold:
+                logger.info(
+                    "[VLN] Object '%s' confirmed (%d/%d checks, threshold=%d) "
+                    "after %.0f deg rotation",
+                    obj, detections, checks, effective_threshold, total_rotated,
+                )
+                return best_bbox
+
+            logger.info(
+                "[VLN] Object '%s' not confirmed (%d/%d checks), rotating %.0f deg",
+                obj, detections, checks, step_deg,
+            )
+
+            # Rotate in place — collision-safe via A* planner
+            try:
+                move_rpc = self.get_rpc_calls("UnitreeSkillContainer.relative_move")
+                move_rpc(0.0, 0.0, step_deg)
+            except Exception:
+                logger.warning("[VLN] relative_move unavailable during confirmation scan")
+                return None
+
+            total_rotated += step_deg
+            time.sleep(check_delay)  # let robot settle after rotation
+
+        logger.info("[VLN] Object '%s' not confirmed after full 360 deg scan", obj)
+        return None
+
     def _approach_object(self, bbox: BBox, object_description: str = "") -> str:
         """Approach a detected object. Uses NavDP imagegoal if available, else A*.
 
-        When NavDP is active, the current camera frame (containing the detected
-        object) is sent as a reference image, and NavDP's diffusion policy
-        drives toward it using imagegoal_step. This is more robust than A*
-        step-by-step approach because the policy handles obstacle avoidance
-        and visual servoing natively.
+        When NavDP is active, a cropped reference image (centred on the bbox)
+        is sent to NavDP, and the diffusion policy drives toward it using
+        imagegoal_step. This is more robust than A* step-by-step approach
+        because the policy handles obstacle avoidance and visual servoing
+        natively.
         """
         # Try NavDP imagegoal approach first
         if self._has_navdp():
-            logger.info("[VLN] Using NavDP imagegoal for approach")
-            result = self._approach_via_navdp(object_description)
+            logger.info("[VLN] Using NavDP imagegoal for approach (bbox=%s)", bbox)
+            result = self._approach_via_navdp(object_description, bbox=bbox)
             if result:  # non-empty = NavDP handled it
                 return result
             logger.info("[VLN] NavDP approach failed, falling back to A*")
@@ -623,7 +920,7 @@ class VLNSkillContainer(Module[VLNConfig]):
         logger.info(f"[VLN] Phase 2: searching for object '{obj}'")
 
         # First: check if object is already in view
-        bbox = self._check_object_in_view(obj)
+        bbox, _ = self._check_object_in_view(obj)
         if bbox:
             logger.info(f"[VLN] Object '{obj}' already in view!")
             result = self._approach_object(bbox, obj)
@@ -635,7 +932,7 @@ class VLNSkillContainer(Module[VLNConfig]):
             reached = self._wait_for_navigation(timeout=30.0)
             if reached:
                 # Double-check with VLM at destination
-                bbox = self._check_object_in_view(obj)
+                bbox, _ = self._check_object_in_view(obj)
                 if bbox:
                     result = self._approach_object(bbox, obj)
                     return f"Found '{obj}' via semantic map. {result}"
@@ -651,29 +948,53 @@ class VLNSkillContainer(Module[VLNConfig]):
                 self._stop_exploration()
                 return "Search cancelled."
 
-            bbox = self._check_object_in_view(obj)
+            bbox, capture_odom = self._check_object_in_view(obj)
             if bbox:
-                logger.info(f"[VLN] Found '{obj}' during exploration!")
-                self._stop_exploration()
-                # Cancel any lingering A* planner goal from the frontier explorer
-                try:
-                    cancel_rpc = self.get_rpc_calls("ReplanningAStarPlanner.cancel_goal")
-                    cancel_rpc()
-                except Exception:
-                    pass
-                # Let the robot settle before starting approach
-                time.sleep(1.0)
-                # Re-check object visibility after settling
-                bbox = self._check_object_in_view(obj)
-                if not bbox:
-                    logger.info(f"[VLN] Object '{obj}' lost after exploration stop, re-checking...")
-                    time.sleep(1.0)
-                    bbox = self._check_object_in_view(obj)
+                logger.info(
+                    "[VLN] Found '%s' during exploration! (mode=%s)",
+                    obj, self.config.exploration_mode,
+                )
+
+                # === CRITICAL: stop the robot IMMEDIATELY ===
+                if self.config.exploration_mode == "navdp":
+                    self._stop_exploration()
+                else:
+                    try:
+                        cancel_rpc = self.get_rpc_calls("ReplanningAStarPlanner.cancel_goal")
+                        cancel_rpc()
+                    except Exception:
+                        pass
+
+                    self._stop_exploration()
+
+                    try:
+                        cancel_rpc = self.get_rpc_calls("ReplanningAStarPlanner.cancel_goal")
+                        cancel_rpc()
+                    except Exception:
+                        pass
+
+                # --- Overrun detection: navigate back if needed ---
+                overrun = self._compute_overrun(capture_odom)
+                if overrun > self.config.max_overrun_m:
+                    logger.info(
+                        "[VLN] Overrun %.1fm (> %.1fm) — navigating back to capture pose",
+                        overrun, self.config.max_overrun_m,
+                    )
+                    self._navigate_to_capture_pose(capture_odom)
+
+                # Confirmation phase: stop, majority-vote VLM, rotate+recheck
+                # up to a full 360 degrees before giving up on this detection.
+                # 1.5s settle ensures MuJoCo momentum has dissipated and the
+                # camera has a stable, non-blurred frame before the first check.
+                time.sleep(1.5)  # let robot settle after stop
+                # Pass initial_bbox so _confirm_detection can pre-align the
+                # robot toward the detection before majority-vote checks begin.
+                bbox = self._confirm_detection(obj, initial_bbox=bbox)
                 if bbox:
                     result = self._approach_object(bbox, obj)
                     return f"Found '{obj}' during exploration. {result}"
                 else:
-                    logger.info(f"[VLN] Object '{obj}' lost after exploration stop, resuming search")
+                    logger.info("[VLN] Detection not confirmed after 360 scan, resuming exploration")
                     self._start_exploration()
                     continue
 
@@ -739,6 +1060,12 @@ class VLNSkillContainer(Module[VLNConfig]):
         # Wait for the search to complete (blocking skill call)
         self._search_thread.join(timeout=self.config.search_timeout + 30)
 
+        # If the thread is still alive after the join window the RPC caller
+        # has likely already timed out.  Force-cancel so NavDP stops moving.
+        if self._search_thread.is_alive():
+            logger.warning("[VLN] Search thread still alive after join timeout — force-cancelling")
+            self._cancel_search()
+
         result = self._search_result or "Search ended without a result."
         decomp_info = f"[Decomposed: room={room!r}, object={obj!r}]"
         return f"{decomp_info} {result}"
@@ -788,6 +1115,12 @@ class VLNSkillContainer(Module[VLNConfig]):
         self._search_thread = threading.Thread(target=_run, daemon=True)
         self._search_thread.start()
         self._search_thread.join(timeout=self.config.search_timeout + 30)
+
+        # Force-cancel if thread outlived the join window to prevent NavDP
+        # from continuing to drive unsupervised after an RPC timeout.
+        if self._search_thread.is_alive():
+            logger.warning("[VLN] Search thread still alive after join timeout — force-cancelling")
+            self._cancel_search()
 
         return self._search_result or "Search ended without a result."
 
