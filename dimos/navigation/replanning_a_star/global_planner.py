@@ -308,7 +308,10 @@ class GlobalPlanner(Resource):
             current_odom = self._current_odom
             current_goal = self._current_goal
 
-        assert current_goal is not None
+        if current_goal is None:
+            # Goal was cancelled by another thread between cancel_goal(but_will_try_again)
+            # and reading _current_goal — nothing to plan for.
+            return
 
         if current_odom is None:
             logger.warning("Cannot handle goal request: missing odometry.")
