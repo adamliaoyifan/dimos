@@ -46,19 +46,45 @@ class AgentConfig:
 @dataclass
 class SearchConfig:
     vlm_check_interval: float = 1.0
-    search_timeout: float = 120.0
+    search_timeout: float = 300.0
+    """Hard maximum for the search loop (seconds).  Raised from 120 to allow
+    adaptive timeout logic to keep the robot exploring as long as coverage
+    is progressing."""
+    search_stall_timeout: float = 60.0
+    """Give up when the robot stops covering new ground for this many seconds."""
+    search_progress_distance: float = 1.0
+    """Metres of new trail distance needed within each stall window to count
+    as 'making progress'."""
+    search_observed_fraction: float = 0.85
+    """If the costmap observed fraction exceeds this value, the boundary is
+    considered fully explored and the search terminates early."""
     approach_timeout: float = 30.0
     similarity_threshold: float = 0.23
     exploration_mode: str = "astar"
     """Exploration backend: "astar" (WavefrontFrontier + A*) or "navdp" (diffusion-policy nogoal)."""
     confirm_checks: int = 3
     confirm_threshold: int = 2
-    confirm_rotate_deg: float = 20.0
+
+    """Total degrees to sweep during object confirmation."""
     confirm_check_delay: float = 1.5
     max_overrun_m: float = 0.5
     """When the robot has moved more than this distance since the VLM image
     was captured (due to VLM latency), navigate back to the capture pose
     before attempting to confirm the detection."""
+
+    navdp_imagegoal_debug_dir: str = ""
+    navdp_imagegoal_width: int = 640
+    navdp_imagegoal_height: int = 480
+    """If non-empty, save each NavDP imagegoal reference image (cropped when
+    a bbox is used) as PNG under this directory."""
+
+    approach_stop_distance: float = 0.6
+    """Distance from the estimated object centre to stop at during A* approach (metres)."""
+    approach_min_depth_confidence: float = 0.3
+    """Minimum valid-pixel fraction required to trust a depth-based 3D estimate."""
+    approach_ema_alpha: float = 0.3
+    """EMA learning rate for updating the 3D target position during approach."""
+
 
 
 @dataclass
@@ -78,7 +104,11 @@ class TrajectorySelectorConfig:
     explore_weight: float = 5.0
     explore_radius: float = 2.0
     explore_endpoint_bonus: float = 1.0
+    recency_damping_count: int = 3
+    open_space_weight: float = 5.0
+    open_space_radius: float = 0.6
     depth_obstacle_m: float = 0.5
+    direction_weight: float = 5.0
 
 
 @dataclass

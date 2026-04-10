@@ -66,7 +66,11 @@ class TrajectorySelector:
     cost_threshold : int
         Cells with cost >= this are lethal (impassable). Matches A* convention.
     unknown_penalty : float
-        Fraction of cost_threshold applied to unknown (-1) cells.
+        Fraction of cost_threshold applied to unknown (-1) cells.  Applied as
+        ``(num_unknown_waypoints / num_sampled_waypoints) * cost_threshold *
+        unknown_penalty`` so the contribution is bounded regardless of horizon
+        length.  A fully-unknown trajectory contributes
+        ``cost_threshold * unknown_penalty`` to the raw costmap cost.
     critic_weight : float
         How much to reward the NavDP critic score (subtracted from cost).
     costmap_weight : float
@@ -97,6 +101,20 @@ class TrajectorySelector:
     explore_endpoint_bonus : float
         Weight for the endpoint novelty bonus — rewards trajectories whose
         tip points away from explored territory.
+    recency_damping_count : int
+        Number of most-recent positions in ``explored_positions`` to ignore
+        when computing the proximity penalty.  Lets the robot retrace its
+        last few steps to escape dead ends without being penalized for
+        revisiting cells it just walked over.  At ~0.5 m sampling, a value
+        of 3 ignores the last ~1.5 m of trail.
+    open_space_weight : float
+        Reward weight for the open-space term — subtracted from total cost
+        proportional to the fraction of FREE cells around the trajectory.
+        Encourages trajectories that head into wide-open areas (away from
+        walls and tight corridors).  Set to 0 to disable.
+    open_space_radius : float
+        Half-width in metres of the box sampled around each waypoint when
+        counting nearby FREE cells for the open-space reward.
     depth_obstacle_m : float
         When the minimum depth in the camera's central strip is below this
         distance (metres), forward-pointing trajectories receive a collision
@@ -120,7 +138,11 @@ class TrajectorySelector:
         explore_weight: float = 5.0,
         explore_radius: float = 2.0,
         explore_endpoint_bonus: float = 1.0,
+        recency_damping_count: int = 3,
+        open_space_weight: float = 5.0,
+        open_space_radius: float = 0.6,
         depth_obstacle_m: float = 0.5,
+        direction_weight: float = 3.0,
     ) -> None:
         self._enabled = enabled
         self.cost_threshold = cost_threshold
@@ -137,7 +159,11 @@ class TrajectorySelector:
         self.explore_weight = explore_weight
         self.explore_radius = max(0.01, explore_radius)
         self.explore_endpoint_bonus = explore_endpoint_bonus
+        self.recency_damping_count = max(0, int(recency_damping_count))
+        self.open_space_weight = open_space_weight
+        self.open_space_radius = max(0.0, open_space_radius)
         self.depth_obstacle_m = depth_obstacle_m
+        self.direction_weight = direction_weight
 
     # ------------------------------------------------------------------
     # Enable / disable
@@ -171,6 +197,7 @@ class TrajectorySelector:
         explored_positions: np.ndarray | None = None,
         is_seeking: bool = False,
         depth_image: np.ndarray | None = None,
+        object_direction: str | None = None,
     ) -> SelectionResult:
         """Select the best trajectory from candidates.
 
@@ -310,6 +337,28 @@ class TrajectorySelector:
                 )
                 total += exp_cost * self.explore_weight
 
+            # Open-space reward: subtract a bonus proportional to the
+            # fraction of FREE cells around the trajectory.  Always active
+            # (not gated by SEEK) — this is what gives the robot a way to
+            # find escape routes from walls and dead ends regardless of state.
+            if (
+                costmap is not None
+                and self.open_space_weight > 0
+                and self.open_space_radius > 0
+            ):
+                open_frac = self._open_space_reward(waypoints_world, costmap)
+                total -= open_frac * self.open_space_weight
+
+            # Direction reward: bias toward trajectories heading in the
+            # VLM-detected object direction (left/centre/right).
+            if (
+                object_direction is not None
+                and self.direction_weight > 0
+                and len(waypoints_base) >= 2
+            ):
+                dir_reward = self._direction_reward(waypoints_base, object_direction)
+                total -= dir_reward * self.direction_weight
+
             costs[i] = total
 
         # Select best non-colliding trajectory
@@ -401,7 +450,15 @@ class TrajectorySelector:
         if len(indices) == 0:
             return 0.0, False
 
-        total_cost = 0.0
+        # Track observed-cell cost separately from unknown-waypoint count.
+        # The UNKNOWN contribution is normalized to the *fraction* of unknown
+        # waypoints so a long exploration trajectory through unmapped territory
+        # is not penalized proportional to its length.  Without normalization,
+        # any trajectory entering a few unmapped cells accumulates enough cost
+        # to exceed max_trajectory_cost and the robot cannot explore.
+        observed_cost = 0.0
+        n_sampled = 0
+        n_unknown = 0
         has_collision = False
         half_len = self.robot_length / 2.0
 
@@ -413,13 +470,14 @@ class TrajectorySelector:
 
         for idx in indices:
             wx, wy = waypoints_world[idx]
+            n_sampled += 1
 
             # If waypoint centre is outside the costmap grid, the robot
             # would be driving into unmapped territory.  Treat as collision
             # so the selector never picks a trajectory heading off the map.
             if not (_grid_ox <= wx <= _grid_max_x and _grid_oy <= wy <= _grid_max_y):
                 has_collision = True
-                total_cost += self.collision_penalty
+                observed_cost += self.collision_penalty
                 continue
 
             # Compute local heading from trajectory direction
@@ -439,13 +497,21 @@ class TrajectorySelector:
 
             if cell_max >= self.cost_threshold:
                 has_collision = True
-                total_cost += self.collision_penalty
+                observed_cost += self.collision_penalty
             elif cell_max == CostValues.UNKNOWN:
-                total_cost += self.cost_threshold * self.unknown_penalty
+                n_unknown += 1
             else:
-                total_cost += max(0, cell_max)
+                observed_cost += max(0, cell_max)
 
-        return total_cost, has_collision
+        # Normalized unknown term: fraction of unknown waypoints scaled by
+        # cost_threshold * unknown_penalty.  Bounded by [0, cost_threshold * unknown_penalty].
+        if n_sampled > 0:
+            unknown_fraction = n_unknown / n_sampled
+            unknown_term = unknown_fraction * self.cost_threshold * self.unknown_penalty
+        else:
+            unknown_term = 0.0
+
+        return observed_cost + unknown_term, has_collision
 
     def _frenet_corridor_check(
         self,
@@ -589,7 +655,16 @@ class TrajectorySelector:
             return 0.0
 
         wps = waypoints_world[indices]  # (N, 2)
-        exp = explored_positions  # (M, 2)
+        # Recency damping: drop the most-recent positions of the trail so the
+        # robot can retrace its last few steps without penalty.  This is
+        # critical for escaping dead ends — without it, every backward
+        # trajectory passes through trail points and is penalized.
+        if self.recency_damping_count > 0:
+            exp = explored_positions[: -self.recency_damping_count]
+        else:
+            exp = explored_positions
+        if len(exp) == 0:
+            return 0.0  # no points left after damping
 
         # Vectorised pairwise distances: (N, M)
         # Using broadcasting instead of scipy to avoid an extra dependency.
@@ -609,6 +684,62 @@ class TrajectorySelector:
         )
 
         return avg_penalty - novelty_bonus
+
+    def _open_space_reward(
+        self,
+        waypoints_world: np.ndarray,
+        costmap: OccupancyGrid,
+    ) -> float:
+        """Compute the average fraction of FREE cells around the trajectory.
+
+        For each sampled waypoint within the horizon, count cells inside a
+        square of half-width ``open_space_radius`` (in metres) around the
+        waypoint and report the fraction that are FREE (cost == 0).
+        UNKNOWN and OCCUPIED cells are excluded from the numerator.
+
+        Returns a value in ``[0, 1]``.  Higher means the trajectory passes
+        through more open space — used as a reward (subtracted from total
+        cost) so the selector prefers wider corridors over tight ones and
+        gives the robot a way to ESCAPE walls/dead-ends by heading toward
+        the most-open direction.
+        """
+        if self.open_space_radius <= 0:
+            return 0.0
+        indices = self._horizon_indices(waypoints_world)
+        if len(indices) == 0:
+            return 0.0
+
+        res = costmap.resolution
+        if res <= 0:
+            return 0.0
+        radius_cells = max(1, int(math.ceil(self.open_space_radius / res)))
+        grid = costmap.grid
+        h, w = grid.shape
+
+        free_fractions = []
+        for idx in indices:
+            wx, wy = waypoints_world[idx]
+            gv = costmap.world_to_grid((wx, wy, 0.0))
+            gx, gy = int(gv.x), int(gv.y)
+
+            # Box bounds clipped to grid
+            x_min = max(0, gx - radius_cells)
+            x_max = min(w - 1, gx + radius_cells)
+            y_min = max(0, gy - radius_cells)
+            y_max = min(h - 1, gy + radius_cells)
+            if x_min > x_max or y_min > y_max:
+                continue
+
+            patch = grid[y_min:y_max + 1, x_min:x_max + 1]
+            n_total = patch.size
+            if n_total == 0:
+                continue
+            n_free = int(np.count_nonzero(patch == CostValues.FREE))
+            free_fractions.append(n_free / n_total)
+
+        if not free_fractions:
+            return 0.0
+        return float(np.mean(free_fractions))
 
     def _depth_forward_cost(
         self,
@@ -658,6 +789,32 @@ class TrajectorySelector:
         has_collision = severity > 0.7 and forward_fraction > 0.3
         return cost, has_collision
 
+    def _direction_reward(
+        self,
+        waypoints_base: np.ndarray,
+        direction: str,
+    ) -> float:
+        """Reward trajectories heading in the indicated direction.
+
+        The VLN skill classifies the object as left/centre/right in the
+        camera image and passes it here.  Returns a value in [0, 1] where
+        1 means the trajectory endpoint perfectly aligns with the requested
+        direction.
+
+        In base_link frame: +x = forward, +y = left.
+        """
+        endpoint = waypoints_base[-1]  # (x, y) in base_link
+        dist = math.sqrt(endpoint[0] ** 2 + endpoint[1] ** 2)
+        if dist < 1e-6:
+            return 0.5
+        nx, ny = endpoint[0] / dist, endpoint[1] / dist
+        if direction == "left":
+            return max(0.0, ny)   # +y = left in base_link
+        elif direction == "right":
+            return max(0.0, -ny)  # -y = right in base_link
+        else:  # centre
+            return max(0.0, nx)   # +x = forward in base_link
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -696,6 +853,9 @@ class TrajectorySelector:
 
         We iterate over the axis-aligned bounding box of the OBB in grid space
         and test each cell centre against the rotated rectangle.
+
+        Returns the maximum cost of observed (non-UNKNOWN) cells, or UNKNOWN
+        if no observed cells are within the OBB.
         """
         cos_h = math.cos(heading)
         sin_h = math.sin(heading)
@@ -731,7 +891,10 @@ class TrajectorySelector:
             return int(CostValues.UNKNOWN)
 
         # Check each cell in the AABB; keep only those inside the OBB
-        max_cost = 0
+        # Track whether we've found any observed cells (not UNKNOWN).
+        # If all cells in the OBB are UNKNOWN, return UNKNOWN so the caller
+        # can apply unknown_penalty rather than treating as FREE.
+        max_cost = int(CostValues.UNKNOWN)  # -1
         res = costmap.resolution
         ox = costmap.origin.position.x
         oy = costmap.origin.position.y
@@ -749,8 +912,15 @@ class TrajectorySelector:
                 # Inside OBB?
                 if abs(local_x) <= half_length and abs(local_y) <= half_width:
                     cell_cost = int(costmap.grid[gy, gx])
-                    if cell_cost > max_cost:
-                        max_cost = cell_cost
+                    # Skip UNKNOWN cells; they don't contribute to max_cost
+                    # but if we see them we know the OBB is not entirely unmapped.
+                    if cell_cost != CostValues.UNKNOWN:
+                        if max_cost == CostValues.UNKNOWN:
+                            # First observed cell
+                            max_cost = cell_cost
+                        elif cell_cost > max_cost:
+                            # Update max
+                            max_cost = cell_cost
 
         return max_cost
 

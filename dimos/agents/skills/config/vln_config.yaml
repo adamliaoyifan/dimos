@@ -23,21 +23,35 @@ agent:
 # ── Search behaviour ─────────────────────────────────────────────────
 search:
   vlm_check_interval: 1.0
-  search_timeout: 120.0
+  search_timeout: 300.0             # hard maximum for full search (seconds)
+  search_stall_timeout: 120.0        # give up after this many seconds of no new coverage
+  search_progress_distance: 1.0     # metres of new trail needed per stall window to count as progress
+  search_observed_fraction: 0.85    # if costmap observed fraction exceeds this → boundary fully explored → stop
   approach_timeout: 30.0
   similarity_threshold: 0.23
   # Exploration backend: "astar" (WavefrontFrontier + A*) or "navdp" (diffusion-policy nogoal).
   # Use "navdp" to test NavDP server trajectory generation in isolation.
   exploration_mode: navdp #astar
   # Detection confirmation tuning
-  confirm_checks: 3         # VLM queries per heading
-  confirm_threshold: 2      # required positives out of confirm_checks (standard headings)
-  confirm_rotate_deg: 20.0  # degrees to rotate between heading attempts (< camera HFOV ~38°)
+  confirm_checks: 3         # VLM queries for confirmation
+  confirm_threshold: 2      # required positives out of confirm_checks
   confirm_check_delay: 1.5  # seconds between checks (ensures fresh frame + server breathing room)
+  # NavDP imagegoal: save the cropped (or full-frame) BGR image sent to set_reference_image.
+  # Empty string disables.
+  navdp_imagegoal_debug_dir: /home/adamliao/work/dimos/assets/output/memory/spatial_memory
+  # NavDP imagegoal resize: the bbox crop is resized to this resolution before being sent
+  # to NavDP. Should match the NavDP trajectory camera (640x480 for Go2; adjust for RealSense).
+  navdp_imagegoal_width: 640
+  navdp_imagegoal_height: 480
   # Overrun recovery: if the VLM call takes too long and the robot moves
   # more than this distance past where the image was captured, drive back
   # to the capture pose before confirming.
-  max_overrun_m: 0.5
+  # max_overrun_m: 0.5
+
+  # A* approach with 3D depth-based target localisation
+  approach_stop_distance: 0.6       # stop this many metres from estimated object centre
+  approach_min_depth_confidence: 0.3  # min valid-pixel ratio to trust depth estimate
+  approach_ema_alpha: 0.3            # EMA alpha for filtering 3D target position
 
 # ── NavDP (diffusion-policy navigation) ────────────────────────────
 # Set enabled: true if NavDP inference server is running
@@ -122,7 +136,11 @@ navdp:
     explore_weight: 5.0       # multiplier for exploration cost (only active during SEEK)
     explore_radius: 2.0       # metres; penalty decays to zero at this distance from explored path
     explore_endpoint_bonus: 1.0  # bonus weight for trajectory endpoints heading into novel territory
+    recency_damping_count: 3     # ignore last N trail points (~1.5m at 0.5m sampling) so robot can back out of dead ends
+    open_space_weight: 5.0       # reward weight for trajectories surrounded by FREE cells (encourages escape from walls)
+    open_space_radius: 0.6       # metres; box half-width for counting nearby FREE cells (0=off)
     depth_obstacle_m: 0.5        # metres; depth below this in centre of image → penalise forward trajectories (0=off)
+    direction_weight: 3.0        # reward weight for trajectories heading toward the VLM-detected object direction (left/centre/right)
 
 # ── Escape / stuck recovery ───────────────────────────────────────
 escape:
