@@ -20,6 +20,8 @@ dimos --replay run unitree-go2                  # perception + mapping, replay d
 dimos --replay run unitree-go2 --daemon         # same, backgrounded
 dimos --replay run unitree-go2-agentic          # + LLM agent (GPT-4o) + skills + MCP server
 dimos run unitree-go2-agentic --robot-ip 192.168.123.161  # real Go2 hardware
+dimos --simulation run unitree-go2-vln-local   # VLN + NavDP in MuJoCo sim (local Ollama/Qwen)
+dimos run unitree-go2-vln-local --robot-ip 192.168.123.161  # VLN + NavDP on real Go2
 
 # --- G1 humanoid ---
 dimos --simulation run unitree-g1-agentic-sim   # G1 in MuJoCo sim + agent + skills
@@ -39,6 +41,7 @@ dimos restart          # stop + re-run with same original args
 | Blueprint | Robot | Hardware | Agent | MCP server | Notes |
 |-----------|-------|----------|-------|------------|-------|
 | `unitree-go2-agentic` | Go2 | real | via McpClient | ✓ | McpServer live |
+| `unitree-go2-vln-local` | Go2 | sim/real | Ollama (local) | ✓ | VLN + NavDP; zero cloud keys; web UI on :5556 |
 | `unitree-g1-agentic-sim` | G1 | sim | GPT-4o (G1 prompt) | — | Full agentic sim, no real robot needed |
 | `xarm-perception-agent` | xArm | real | GPT-4o | — | Manipulation + perception + agent |
 | `xarm7-trajectory-sim` | xArm7 | sim | — | — | Trajectory planning sim |
