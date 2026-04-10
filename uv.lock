@@ -1920,6 +1920,9 @@ misc = [
     { name = "xarm-python-sdk" },
     { name = "yapf" },
 ]
+navdp = [
+    { name = "navdp-bridge" },
+]
 perception = [
     { name = "filterpy" },
     { name = "hydra-core" },
@@ -2036,6 +2039,7 @@ requires-dist = [
     { name = "moondream", marker = "extra == 'perception'" },
     { name = "mujoco", marker = "extra == 'sim'", specifier = ">=3.3.4" },
     { name = "mypy", marker = "extra == 'dev'", specifier = "==1.19.0" },
+    { name = "navdp-bridge", marker = "extra == 'navdp'", editable = "../NavDP/ros2_ws/src/navdp_bridge" },
     { name = "numba", specifier = ">=0.60.0" },
     { name = "numpy", specifier = ">=1.26.4" },
     { name = "numpy", marker = "extra == 'docker'", specifier = ">=1.26.4" },
@@ -2152,7 +2156,7 @@ requires-dist = [
     { name = "xformers", marker = "platform_machine == 'x86_64' and extra == 'cuda'", specifier = ">=0.0.20" },
     { name = "yapf", marker = "extra == 'misc'", specifier = "==0.40.2" },
 ]
-provides-extras = ["misc", "visualization", "agents", "web", "perception", "unitree", "manipulation", "cpu", "cuda", "dev", "psql", "sim", "drone", "dds", "docker", "base"]
+provides-extras = ["misc", "visualization", "agents", "web", "perception", "unitree", "manipulation", "cpu", "cuda", "dev", "psql", "sim", "drone", "navdp", "dds", "docker", "base"]
 
 [[package]]
 name = "dimos-lcm"
@@ -5293,6 +5297,17 @@ sdist = { url = "https://files.pythonhosted.org/packages/fc/6f/713be67779028d482
 wheels = [
     { url = "https://files.pythonhosted.org/packages/03/cc/7cb74758e6df95e0c4e1253f203b6dd7f348bf2f29cf89e9210a2416d535/narwhals-2.16.0-py3-none-any.whl", hash = "sha256:846f1fd7093ac69d63526e50732033e86c30ea0026a44d9b23991010c7d1485d", size = 443951, upload-time = "2026-02-02T10:30:58.635Z" },
 ]
+
+[[package]]
+name = "navdp-bridge"
+version = "0.1.0"
+source = { editable = "../NavDP/ros2_ws/src/navdp_bridge" }
+dependencies = [
+    { name = "setuptools" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "setuptools" }]
 
 [[package]]
 name = "nbformat"

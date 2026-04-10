@@ -2,6 +2,11 @@
 requires = ["setuptools>=70", "wheel", "pybind11>=2.12"]
 build-backend = "setuptools.build_meta"
 
+[tool.uv.sources]
+# navdp_bridge is a local package from the NavDP repo — not on PyPI.
+# Path is relative to this pyproject.toml.  Run: uv sync --extra navdp
+navdp-bridge = { path = "../NavDP/ros2_ws/src/navdp_bridge", editable = true }
+
 [tool.setuptools]
 include-package-data = false
 
@@ -303,6 +308,10 @@ sim = [
 
 drone = [
     "pymavlink"
+]
+
+navdp = [
+    "navdp-bridge",
 ]
 
 dds = [

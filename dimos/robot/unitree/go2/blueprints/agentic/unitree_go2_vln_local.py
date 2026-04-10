@@ -40,7 +40,7 @@ os.environ["OLLAMA_HOST"] = cfg.agent.ollama_base_url
 from dimos.agents.mcp.mcp_client import McpClient
 from dimos.agents.mcp.mcp_server import McpServer
 from dimos.agents.ollama_agent import ollama_installed
-from dimos.agents.skills.escape_skill import EscapeSkillContainer
+# from dimos.agents.skills.escape_skill import EscapeSkillContainer
 from dimos.agents.skills.navigation import NavigationSkillContainer
 from dimos.agents.skills.person_follow import PersonFollowSkillContainer
 from dimos.agents.skills.speak_skill import SpeakSkill
@@ -144,36 +144,41 @@ if cfg.blueprint.enable_tts:
 _local_skills = autoconnect(*_skill_blueprints)
 
 # ── Escape / stuck recovery ──────────────────────────────────────────
-_escape_blueprint = EscapeSkillContainer.blueprint(
-    vlm_backend=cfg.vlm.backend,
-    vlm_base_url=cfg.vlm.base_url,
-    enable_vlm_check=True,
-    vlm_prompt_prefix=_sim_prefix,
-    stuck_time_window=cfg.escape.stuck_time_window,
-    stuck_distance_threshold=cfg.escape.stuck_distance_threshold,
-    escape_backup_distance=cfg.escape.escape_backup_distance,
-    escape_rotate_degrees=cfg.escape.escape_rotate_degrees,
-    max_escape_attempts=cfg.escape.max_escape_attempts,
-) if cfg.escape.enabled else None
+# _escape_blueprint = EscapeSkillContainer.blueprint(
+#     vlm_backend=cfg.vlm.backend,
+#     vlm_base_url=cfg.vlm.base_url,
+#     enable_vlm_check=True,
+#     vlm_prompt_prefix=_sim_prefix,
+#     stuck_time_window=cfg.escape.stuck_time_window,
+#     stuck_distance_threshold=cfg.escape.stuck_distance_threshold,
+#     escape_backup_distance=cfg.escape.escape_backup_distance,
+#     escape_rotate_degrees=cfg.escape.escape_rotate_degrees,
+#     max_escape_attempts=cfg.escape.max_escape_attempts,
+# ) if cfg.escape.enabled else None
+
+# ── Camera config (always resolved — used for VLNSkillContainer + NavDP) ─────
+import numpy as np
+from dimos.core.transport import pSHMTransport
+from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
+from dimos.msgs.geometry_msgs.Twist import Twist
+from dimos.msgs.sensor_msgs.Image import Image
+
+_traj_cam = cfg.navdp.get_trajectory_camera()
+_cam_intrinsic_np = (
+    np.array(_traj_cam.intrinsic, dtype=np.float32)
+    if _traj_cam.intrinsic is not None
+    else None
+)
+# Pass as native Python list (not numpy array) for ModuleConfig serialisation
+_cam_intrinsic_list = _traj_cam.intrinsic  # list[list[float]] | None
 
 # ── Optional NavDP (diffusion-policy) skills ─────────────────────────
 _navdp_blueprints = []
 if cfg.navdp.enabled:
-    import numpy as np
     from dimos.core.blueprints import autoconnect as _autoconnect
-    from dimos.core.transport import pSHMTransport
-    from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
-    from dimos.msgs.geometry_msgs.Twist import Twist
-    from dimos.msgs.sensor_msgs.Image import Image
     from dimos.navigation.navdp import navdp_navigator, navdp_memory, navdp_skills
 
-    # Resolve the active camera profile for trajectory inference.
-    _traj_cam = cfg.navdp.get_trajectory_camera()
-    _cam_intrinsic = (
-        np.array(_traj_cam.intrinsic, dtype=np.float32)
-        if _traj_cam.intrinsic is not None
-        else None
-    )
+    _cam_intrinsic = _cam_intrinsic_np
 
     # In real deployment with a separate RealSense, wire the navigator's
     # navdp_image / navdp_depth streams to the RealSense transport channels
@@ -246,20 +251,47 @@ _all_components = [
     ),
     _local_skills,
     VLNSkillContainer.blueprint(
+        # VLM
         vlm_backend=cfg.vlm.backend,
         vlm_base_url=cfg.vlm.base_url,
         vlm_model_name=cfg.vlm.model_name,
         vlm_prompt_prefix=_sim_prefix,
+        # Search timing
         vlm_check_interval=cfg.search.vlm_check_interval,
         search_timeout=cfg.search.search_timeout,
+        search_stall_timeout=cfg.search.search_stall_timeout,
+        search_progress_distance=cfg.search.search_progress_distance,
+        search_observed_fraction=cfg.search.search_observed_fraction,
         approach_timeout=cfg.search.approach_timeout,
         similarity_threshold=cfg.search.similarity_threshold,
         exploration_mode=cfg.search.exploration_mode,
-    ),
+        # Detection confirmation
+        confirm_checks=cfg.search.confirm_checks,
+        confirm_threshold=cfg.search.confirm_threshold,
+        confirm_check_delay=cfg.search.confirm_check_delay,
+        # NavDP imagegoal debug
+        navdp_imagegoal_debug_dir=cfg.search.navdp_imagegoal_debug_dir,
+        navdp_imagegoal_width=cfg.search.navdp_imagegoal_width,
+        navdp_imagegoal_height=cfg.search.navdp_imagegoal_height,
+        # 3D approach
+        approach_stop_distance=cfg.search.approach_stop_distance,
+        approach_min_depth_confidence=cfg.search.approach_min_depth_confidence,
+        approach_ema_alpha=cfg.search.approach_ema_alpha,
+        # Camera intrinsics/extrinsics for ObjectLocalizer
+        cam_intrinsic=_cam_intrinsic_list,
+        cam_x=_traj_cam.x,
+        cam_y=_traj_cam.y,
+        cam_z=_traj_cam.z,
+        cam_pitch=_traj_cam.pitch,
+    ).transports({
+        ("depth_image", Image): pSHMTransport("depth_image"),
+        ("color_image", Image): pSHMTransport("color_image"),
+        ("odom", PoseStamped): pSHMTransport("odom"),
+    }),
 ]
 
-if _escape_blueprint is not None:
-    _all_components.append(_escape_blueprint)
+# if _escape_blueprint is not None:
+#     _all_components.append(_escape_blueprint)
 
 _all_components.extend(_navdp_blueprints)
 
