@@ -42,6 +42,7 @@ from dimos.core.stream import In, Out
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
 from dimos.msgs.sensor_msgs.Image import Image
 from dimos.msgs.sensor_msgs.Image import ImageFormat
+from dimos.navigation.visual.object_localizer import ObjectInstance
 
 logger = logging.getLogger(__name__)
 
@@ -213,6 +214,10 @@ class NavDPMemory(Module):
         self._landmark_count = 0
         self._query_count = 0
         self._start_time: float = 0.0
+
+        # Instance-level object memory: label → list[ObjectInstance]
+        self._object_instances: dict[str, list[ObjectInstance]] = {}
+        self._instance_lock = threading.Lock()
 
         super().__init__()
 
@@ -660,6 +665,108 @@ class NavDPMemory(Module):
             )
         return True
 
+
+    @rpc
+    def record_object_instance(
+        self,
+        label: str,
+        x: float,
+        y: float,
+        z: float,
+        confidence: float,
+        depth_m: float,
+        ema_alpha: float = 0.3,
+    ) -> str:
+        """Record or update a 3D object instance in spatial memory.
+
+        If an existing instance with the same label is within 1.5 m of the
+        provided position, its position is EMA-updated.  Otherwise a new
+        instance is created.  Returns the instance ID.
+
+        Args:
+            label: Semantic object label (e.g. "red chair").
+            x: World-frame X position (metres).
+            y: World-frame Y position (metres).
+            z: World-frame Z position (metres).
+            confidence: Depth estimate confidence (0–1).
+            depth_m: Raw depth of the estimate (metres).
+            ema_alpha: EMA learning rate for position update.
+        """
+        import math
+        from dimos.navigation.visual.object_localizer import ObjectEstimate
+
+        estimate = ObjectEstimate(
+            x=x, y=y, z=z, confidence=confidence, depth_m=depth_m
+        )
+        merge_radius = 1.5  # metres
+
+        with self._instance_lock:
+            candidates = self._object_instances.setdefault(label, [])
+            best: ObjectInstance | None = None
+            best_dist = float("inf")
+            for inst in candidates:
+                d = math.hypot(inst.x - x, inst.y - y)
+                if d < merge_radius and d < best_dist:
+                    best_dist = d
+                    best = inst
+
+            if best is not None:
+                best.update(estimate, alpha=ema_alpha)
+                instance_id = best.instance_id
+            else:
+                new_inst = ObjectInstance(label=label)
+                new_inst.update(estimate, alpha=1.0)
+                candidates.append(new_inst)
+                instance_id = new_inst.instance_id
+
+        if self._event_log:
+            self._event_log.log(
+                "object_instance_recorded",
+                label=label,
+                x=round(x, 3), y=round(y, 3), z=round(z, 3),
+                confidence=round(confidence, 3),
+                instance_id=instance_id,
+            )
+        return instance_id
+
+    @rpc
+    def query_object_3d(self, label: str, max_results: int = 5) -> list[dict[str, Any]]:
+        """Return known 3D positions for objects matching the given label.
+
+        Performs a case-insensitive substring search over all recorded labels
+        and returns the top ``max_results`` instances sorted by observation count
+        (most observed first).
+
+        Args:
+            label: Object label to search for (substring match).
+            max_results: Maximum number of results to return.
+
+        Returns:
+            List of dicts with keys: instance_id, label, x, y, z,
+            confidence, depth_m, observation_count, last_seen_ts.
+        """
+        label_lower = label.lower()
+        results: list[dict[str, Any]] = []
+
+        with self._instance_lock:
+            for stored_label, instances in self._object_instances.items():
+                if label_lower in stored_label.lower():
+                    for inst in instances:
+                        results.append({
+                            "instance_id": inst.instance_id,
+                            "label": inst.label,
+                            "x": round(inst.x, 3),
+                            "y": round(inst.y, 3),
+                            "z": round(inst.z, 3),
+                            "confidence": round(inst.confidence, 3),
+                            "depth_m": round(inst.depth_m, 3),
+                            "observation_count": inst.observation_count,
+                            "last_seen_ts": inst.last_seen_ts,
+                        })
+
+        results.sort(key=lambda r: r["observation_count"], reverse=True)
+        self._query_count += 1
+        return results[:max_results]
 
     @rpc
     def get_debug_log_path(self) -> str:

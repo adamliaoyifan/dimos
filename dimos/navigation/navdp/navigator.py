@@ -47,6 +47,7 @@ import math
 import sys
 import threading
 import time
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -59,7 +60,7 @@ from dimos_lcm.std_msgs import Bool
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
 from dimos.msgs.geometry_msgs.Twist import Twist
 from dimos.msgs.geometry_msgs.Vector3 import Vector3
-from dimos.msgs.nav_msgs.OccupancyGrid import OccupancyGrid
+from dimos.msgs.nav_msgs.OccupancyGrid import CostValues, OccupancyGrid
 from dimos.msgs.nav_msgs.Path import Path
 from dimos.msgs.sensor_msgs.Image import Image
 from dimos.navigation.base import NavigationInterface, NavigationState
@@ -294,6 +295,7 @@ class NavDPNavigator(Module, NavigationInterface):
         self._tick_thread: threading.Thread | None = None
         self._inference_thread: threading.Thread | None = None
         self._exploration_enabled = False  # controlled by explore_cmd from web UI
+        self._motion_paused = False
 
         # Language goal for VLM-driven navigation
         self._language_goal: str = ""
@@ -320,6 +322,7 @@ class NavDPNavigator(Module, NavigationInterface):
         self._last_diag_time: float = 0.0
         self._diag_interval: float = 5.0  # log status every 5 seconds
         self._inference_fail_count: int = 0
+        self._last_infer_mode: str = "unknown"
 
         # Stuck detection: track recent odom positions to detect when the
         # robot is not making progress (e.g. pushing against a wall).
@@ -329,6 +332,7 @@ class NavDPNavigator(Module, NavigationInterface):
         self._stuck_rotate_duration: float = 2.0  # seconds to rotate when stuck
         self._stuck_rotate_start: float = 0.0  # when current rotation started
         self._is_rotating_to_escape: bool = False
+        self._selector_halt_streak: int = 0
 
         # Exploration trail: subsampled (x, y) positions for the exploration
         # cost in the trajectory selector.  Updated every tick when the robot
@@ -341,6 +345,16 @@ class NavDPNavigator(Module, NavigationInterface):
         # Timestamp when navigator last went IDLE (via cancel_goal or goal reached).
         # Used to keep publishing zero cmd_vel for a short braking window.
         self._idle_since: float = 0.0
+
+        # APPROACH grace period: ignore depth-threshold for this many seconds
+        # after entering APPROACH, giving the policy time to rotate toward the
+        # target before depth_ahead becomes meaningful.
+        self._approach_grace_s: float = 2.0
+        self._approach_start_time: float = 0.0
+
+        # VLM-driven direction hint for the trajectory selector during APPROACH.
+        # Set by VLNSkillContainer via RPC; "left", "centre", "right", or None.
+        self._object_direction: str | None = None
 
         super().__init__(**kwargs)
 
@@ -578,10 +592,14 @@ class NavDPNavigator(Module, NavigationInterface):
             self._nav_state = NavigationState.IDLE
             self._goal_reached = False
         self._odom_history.clear()
-        self._explore_trail.clear()
-        self._explore_trail_last_pos = None
+        # NOTE: exploration trail is intentionally preserved across
+        # cancel_goal so that retried searches benefit from knowing
+        # where the robot has already been.  Use clear_exploration_trail()
+        # for an explicit reset.
         self._is_rotating_to_escape = False
+        self._selector_halt_streak = 0
         self._skip_vlm_detection = False
+        self._object_direction = None
         self._idle_since = time.time()
         if self._state_machine is not None:
             self._state_machine.clear_goal()
@@ -589,6 +607,49 @@ class NavDPNavigator(Module, NavigationInterface):
             self._goal_context.clear_language_goal()
         self.cmd_vel.publish(Twist())
         logger.info("NavDP goal cancelled")
+        return True
+
+    @rpc
+    def pause_motion(self) -> bool:
+        """Pause motion without clearing goal/state history."""
+        self._motion_paused = True
+        self.cmd_vel.publish(Twist())
+        logger.info("NavDP motion paused")
+        return True
+
+    @rpc
+    def resume_motion(self) -> bool:
+        """Resume motion after pause_motion()."""
+        self._motion_paused = False
+        logger.info("NavDP motion resumed")
+        return True
+
+    @rpc
+    def set_object_direction(self, direction: str) -> None:
+        """Set the VLM-detected object direction hint for trajectory selection.
+
+        Args:
+            direction: "left", "centre", or "right".
+        """
+        self._object_direction = direction
+        logger.info("NavDP object direction set: %s", direction)
+
+    @rpc
+    def clear_object_direction(self) -> None:
+        """Clear the object direction hint."""
+        self._object_direction = None
+
+    @rpc
+    def clear_exploration_trail(self) -> bool:
+        """Explicitly clear the exploration trail.
+
+        Unlike ``cancel_goal()`` (which preserves the trail for retries),
+        this resets the trail entirely.  Call when starting a fundamentally
+        new task where past exploration data is irrelevant.
+        """
+        self._explore_trail.clear()
+        self._explore_trail_last_pos = None
+        logger.info("NavDP exploration trail cleared")
         return True
 
     # --- NavDP-specific RPCs ---
@@ -626,6 +687,7 @@ class NavDPNavigator(Module, NavigationInterface):
         # Reset stuck detection for the new goal
         self._odom_history.clear()
         self._is_rotating_to_escape = False
+        self._selector_halt_streak = 0
         if self._goal_context is not None:
             self._goal_context.set_language_goal(goal)
         if self._state_machine is not None:
@@ -666,13 +728,21 @@ class NavDPNavigator(Module, NavigationInterface):
         # Force state machine to APPROACH
         self._state_machine.state = nb["NavState"].APPROACH
         self._state_machine.lost_count = 0
+        # Start grace period so depth-threshold is not checked immediately.
+        # The policy needs a moment to rotate toward the target before the
+        # centre-ROI depth is meaningful.
+        self._approach_start_time = time.time()
+        # Skip internal VLM detection — the VLN skill handles detection
+        # externally.  Without this, the internal VLM may not recognise the
+        # target and revert APPROACH → SEEK via lost_count.
+        self._skip_vlm_detection = True
         # Ensure the control loop is active (not skipped by the IDLE guard)
         self._nav_state = NavigationState.FOLLOWING_PATH
         # Tell inference thread to switch to imagegoal_step
         with self._infer_lock:
             self._infer_mode = "imagegoal"
             self._infer_ref_img = ref_img
-        logger.info("NavDP reference image set externally → APPROACH (nav_state=FOLLOWING_PATH)")
+        logger.info("NavDP reference image set externally → APPROACH (nav_state=FOLLOWING_PATH, skip_vlm=True)")
         return True
 
     @rpc
@@ -686,6 +756,57 @@ class NavDPNavigator(Module, NavigationInterface):
         if self._state_machine is None:
             return "UNINITIALIZED"
         return self._state_machine.state.name
+
+    @rpc
+    def get_exploration_stats(self) -> dict:
+        """Return exploration coverage statistics for adaptive search timeout.
+
+        Returns a dict with:
+        - trail_length: number of trail points recorded
+        - trail_distance_m: total path length of the trail (metres)
+        - coverage_radius_m: max distance from trail centroid (rough coverage radius)
+        - observed_fraction: fraction of costmap cells that are observed (not UNKNOWN)
+        - costmap_available: whether a costmap is currently available
+        """
+        trail = list(self._explore_trail)
+        costmap = self._latest_costmap
+
+        # Trail distance (arc length)
+        trail_distance = 0.0
+        if len(trail) >= 2:
+            for i in range(1, len(trail)):
+                trail_distance += math.hypot(
+                    trail[i][0] - trail[i - 1][0],
+                    trail[i][1] - trail[i - 1][1],
+                )
+
+        # Coverage radius (max distance from centroid)
+        coverage_radius = 0.0
+        if len(trail) >= 2:
+            xs = [p[0] for p in trail]
+            ys = [p[1] for p in trail]
+            cx, cy = sum(xs) / len(xs), sum(ys) / len(ys)
+            coverage_radius = max(
+                math.hypot(x - cx, y - cy) for x, y in trail
+            )
+
+        # Costmap observed fraction
+        observed_fraction = 0.0
+        costmap_available = costmap is not None
+        if costmap is not None:
+            grid = costmap.grid
+            n_total = grid.size
+            if n_total > 0:
+                n_observed = int(np.count_nonzero(grid != CostValues.UNKNOWN))
+                observed_fraction = n_observed / n_total
+
+        return {
+            "trail_length": len(trail),
+            "trail_distance_m": round(trail_distance, 2),
+            "coverage_radius_m": round(coverage_radius, 2),
+            "observed_fraction": round(observed_fraction, 4),
+            "costmap_available": costmap_available,
+        }
 
     # --- Stuck detection ---
 
@@ -712,7 +833,13 @@ class NavDPNavigator(Module, NavigationInterface):
 
         oldest = self._odom_history[0]
         dist = math.hypot(x - oldest[1], y - oldest[2])
-        return dist < self._stuck_dist_thresh
+        stuck = dist < self._stuck_dist_thresh
+        yaw_delta = abs((yaw - oldest[3] + math.pi) % (2 * math.pi) - math.pi)
+        if self._selector_halt_streak >= 3 or stuck or dist < (self._stuck_dist_thresh * 3.0):
+            last_diag = getattr(self, "_last_stuck_debug_time", 0.0)
+            if (now - last_diag) > 0.75:
+                self._last_stuck_debug_time = now
+        return stuck
 
     # --- Exploration trail ---
 
@@ -1019,16 +1146,42 @@ class NavDPNavigator(Module, NavigationInterface):
                 )
             time.sleep(dt)
 
-    def _tick(self) -> None:
-        """Single control tick using the NavDP state machine.
+    # ------------------------------------------------------------------
+    # Control-loop context (passed between _tick_* stage methods)
+    # ------------------------------------------------------------------
 
-        State machine flow:
-            IDLE → (set_language_goal) → SEEK → (VLM found) → APPROACH → (depth < thresh) → STOPPED
-                                          ↑                      │
-                                          └──────────────────────┘ (lost target)
+    @dataclass
+    class _TickContext:
+        """Data bag passed between _tick_* stage methods each control cycle."""
+        image: np.ndarray
+        odom: "tuple[float, float, float]"
+        # Populated by _tick_state_machine_update
+        sm_depth: np.ndarray = field(
+            default_factory=lambda: np.zeros((1, 1), dtype=np.float32)
+        )
+        depth_ahead: float = 0.0
+        # Populated by _tick_read_trajectory
+        traj: "np.ndarray | None" = None
+        all_traj: "np.ndarray | None" = None
+        all_vals: "np.ndarray | None" = None
+        traj_age: float = float("inf")
+        infer_mode: str = "nogoal"
+        # Populated by _tick_select_trajectory
+        waypoints: "np.ndarray | None" = None
+        v: float = 0.0
+        w: float = 0.0
+
+    # ------------------------------------------------------------------
+    # _tick stage methods
+    # ------------------------------------------------------------------
+
+    def _tick_guard_checks(self) -> "_TickContext | None":
+        """Acquire sensor snapshot; early-return for unready / paused / IDLE state.
+
+        Returns a populated _TickContext or None if the tick should exit.
         """
         with self._lock:
-            image = self._latest_image  # Go2 camera — VLM detection only
+            image = self._latest_image
             odom = self._latest_odom
 
         if image is None or odom is None:
@@ -1041,7 +1194,7 @@ class NavDPNavigator(Module, NavigationInterface):
                     f"odom={'yes' if odom is not None else 'NO'})",
                     flush=True,
                 )
-            return
+            return None
 
         # When IDLE and exploration not enabled from the web UI, skip tick.
         # Keep publishing zero cmd_vel for a short braking window after cancel
@@ -1049,13 +1202,19 @@ class NavDPNavigator(Module, NavigationInterface):
         if self._nav_state == NavigationState.IDLE and not self._exploration_enabled:
             if (time.time() - self._idle_since) < 1.0:
                 self.cmd_vel.publish(Twist())
-            return
+            return None
+
+        # Transient pause used by VLN blocking VLM checks.  Unlike cancel_goal(),
+        # this intentionally preserves nav state and stuck/escape history.
+        if self._motion_paused:
+            self.cmd_vel.publish(Twist())
+            return None
 
         # Record position for exploration trail (used by trajectory selector)
         self._update_explore_trail(odom[0], odom[1])
 
         # Log first tick after goal is set
-        if not hasattr(self, '_first_active_tick_logged'):
+        if not hasattr(self, "_first_active_tick_logged"):
             self._first_active_tick_logged = False
         if not self._first_active_tick_logged:
             self._first_active_tick_logged = True
@@ -1065,18 +1224,16 @@ class NavDPNavigator(Module, NavigationInterface):
                 flush=True,
             )
 
-        nb = _navdp_bridge
-        if nb is None:
+        if _navdp_bridge is None:
             print("[NavDP] tick: navdp_bridge=None, skipping", flush=True)
-            return
+            return None
 
+        return self._TickContext(image=image, odom=odom)
+
+    def _tick_vlm_detection(self, ctx: "_TickContext") -> None:
+        """Run periodic VLM detection for state machine SEEK/APPROACH transitions."""
+        nb = _navdp_bridge
         NavState = nb["NavState"]
-
-        # --- Run VLM detection periodically (for state machine transitions) ---
-        # Uses color_image (Go2 built-in camera) — separate from the trajectory
-        # camera so scene understanding always uses a consistent view.
-        # Skip when: (a) goal is a dummy exploration phrase set by VLN skill,
-        # or (b) enable_internal_vlm=False (VLN handles all VLM externally).
         if (
             self._enable_internal_vlm
             and self._language_goal
@@ -1085,7 +1242,16 @@ class NavDPNavigator(Module, NavigationInterface):
         ):
             sm_state = self._state_machine.state
             if sm_state in (NavState.SEEK, NavState.APPROACH):
-                self._run_vlm_detection(image)
+                self._run_vlm_detection(ctx.image)
+
+    def _tick_state_machine_update(self, ctx: "_TickContext") -> bool:
+        """Compute depth, update SM, handle state transitions.
+
+        Populates ctx.sm_depth and ctx.depth_ahead.
+        Returns True if the tick should exit early (goal reached → STOPPED).
+        """
+        nb = _navdp_bridge
+        NavState = nb["NavState"]
 
         # --- Compute depth for state machine (navdp_depth preferred) ---
         # Use the trajectory camera's depth for SM transitions (more accurate).
@@ -1095,120 +1261,164 @@ class NavDPNavigator(Module, NavigationInterface):
             fallback_depth_raw = self._latest_depth
 
         sm_depth_raw = navdp_depth_raw if navdp_depth_raw is not None else fallback_depth_raw
-        if sm_depth_raw is not None and sm_depth_raw.shape[:2] == image.shape[:2]:
-            sm_depth = sm_depth_raw.astype(np.float32) if sm_depth_raw.dtype != np.float32 else sm_depth_raw
-        else:
-            sm_depth = np.zeros((image.shape[0], image.shape[1]), dtype=np.float32)
-        depth_ahead = nb["get_depth_ahead"](sm_depth)
-
-        old_state = None
-        if self._state_machine is not None:
-            old_state = self._state_machine.state
-            # Only pass a real VLM result to the state machine on the tick
-            # where the VLM actually ran.  On all other ticks use "pending"
-            # so the SM does not count stale "unknown" results against
-            # lost_count (which would fire at 10 Hz instead of ~1 Hz,
-            # abandoning APPROACH after only 0.5 s instead of ~5 s).
-            vlm_mode_for_sm = self._last_vlm_mode if self._vlm_result_fresh else "pending"
-            vlm_conf_for_sm = self._last_vlm_conf if self._vlm_result_fresh else 0.0
-            self._vlm_result_fresh = False
-            self._state_machine.update(
-                vlm_mode=vlm_mode_for_sm,
-                vlm_conf=vlm_conf_for_sm,
-                depth_ahead=depth_ahead,
+        if sm_depth_raw is not None and sm_depth_raw.shape[:2] == ctx.image.shape[:2]:
+            ctx.sm_depth = (
+                sm_depth_raw.astype(np.float32)
+                if sm_depth_raw.dtype != np.float32
+                else sm_depth_raw
             )
-            new_state = self._state_machine.state
+        else:
+            ctx.sm_depth = np.zeros(
+                (ctx.image.shape[0], ctx.image.shape[1]), dtype=np.float32
+            )
+        ctx.depth_ahead = nb["get_depth_ahead"](ctx.sm_depth)
 
-            # Log any state transition
-            if old_state != new_state:
-                print(
-                    f"[NavDP] SM transition: {old_state.name} → {new_state.name}  "
-                    f"vlm={self._last_vlm_mode}(conf={self._last_vlm_conf:.2f})  "
-                    f"depth_ahead={depth_ahead:.2f}",
-                    flush=True,
-                )
+        if self._state_machine is None:
+            return False
 
-            # Handle SEEK → APPROACH transition: capture reference image and
-            # tell the inference thread to switch to imagegoal_step.
-            if old_state == NavState.SEEK and new_state == NavState.APPROACH:
-                ref_img_cap, image_src = self._goal_context.set_reference_from_transition(image)
-                with self._infer_lock:
-                    self._infer_mode = "imagegoal"
-                    self._infer_ref_img = ref_img_cap
-                logger.info(
-                    "NavDP: target detected (conf=%.2f), using %s → APPROACH",
-                    self._last_vlm_conf, image_src,
-                )
+        old_state = self._state_machine.state
+        # Only pass a real VLM result to the state machine on the tick where
+        # the VLM actually ran.  On all other ticks use "pending" so the SM
+        # does not count stale "unknown" results against lost_count (which
+        # would fire at 10 Hz, abandoning APPROACH after only ~0.5 s).
+        vlm_mode_for_sm = self._last_vlm_mode if self._vlm_result_fresh else "pending"
+        vlm_conf_for_sm = self._last_vlm_conf if self._vlm_result_fresh else 0.0
+        self._vlm_result_fresh = False
 
-            # Handle APPROACH → STOPPED: goal reached
-            if old_state == NavState.APPROACH and new_state == NavState.STOPPED:
-                print(f"[NavDP] GOAL REACHED → IDLE (depth={depth_ahead:.2f})", flush=True)
-                logger.info("NavDP: goal reached (depth=%.2f) → STOPPED", depth_ahead)
-                self._goal_reached = True
-                self._nav_state = NavigationState.IDLE
-                self._idle_since = time.time()
-                self._state_machine.reset()
-                with self._infer_lock:
-                    self._infer_mode = "nogoal"
-                    self._infer_ref_img = None
-                self.cmd_vel.publish(Twist())
-                return
+        # During the APPROACH grace period the centre-ROI depth reading may
+        # reflect a nearby surface the robot is currently facing (e.g. a wall
+        # behind the target).  Clamping to inf prevents a premature
+        # APPROACH → STOPPED transition before the policy has had time to
+        # rotate and advance toward the target.
+        approach_age = time.time() - self._approach_start_time
+        effective_depth = (
+            float("inf")
+            if approach_age < self._approach_grace_s
+            else ctx.depth_ahead
+        )
 
-            # Handle APPROACH → SEEK: lost target — switch inference back to nogoal
-            if old_state == NavState.APPROACH and new_state == NavState.SEEK:
-                with self._infer_lock:
-                    self._infer_mode = "nogoal"
-                    self._infer_ref_img = None
-                logger.info("NavDP: target lost in APPROACH → SEEK (nogoal)")
+        self._state_machine.update(
+            vlm_mode=vlm_mode_for_sm,
+            vlm_conf=vlm_conf_for_sm,
+            depth_ahead=effective_depth,
+        )
+        new_state = self._state_machine.state
 
-        # --- Read latest trajectory from inference thread ---
+        if old_state != new_state:
+            print(
+                f"[NavDP] SM transition: {old_state.name} → {new_state.name}  "
+                f"vlm={self._last_vlm_mode}(conf={self._last_vlm_conf:.2f})  "
+                f"depth_ahead={ctx.depth_ahead:.2f} (effective={effective_depth:.2f})",
+                flush=True,
+            )
+
+        # SEEK → APPROACH: target detected — capture reference image and
+        # tell the inference thread to switch to imagegoal_step.
+        if old_state == NavState.SEEK and new_state == NavState.APPROACH:
+            ref_img_cap, image_src = self._goal_context.set_reference_from_transition(
+                ctx.image
+            )
+            # Start grace period so depth-threshold is not checked immediately.
+            self._approach_start_time = time.time()
+            with self._infer_lock:
+                self._infer_mode = "imagegoal"
+                self._infer_ref_img = ref_img_cap
+            logger.info(
+                "NavDP: target detected (conf=%.2f), using %s → APPROACH",
+                self._last_vlm_conf,
+                image_src,
+            )
+
+        # APPROACH → STOPPED: goal reached — stop and reset.
+        if old_state == NavState.APPROACH and new_state == NavState.STOPPED:
+            print(f"[NavDP] GOAL REACHED → IDLE (depth={ctx.depth_ahead:.2f})", flush=True)
+            logger.info("NavDP: goal reached (depth=%.2f) → STOPPED", ctx.depth_ahead)
+            self._goal_reached = True
+            self._nav_state = NavigationState.IDLE
+            self._object_direction = None
+            self._idle_since = time.time()
+            self._state_machine.reset()
+            with self._infer_lock:
+                self._infer_mode = "nogoal"
+                self._infer_ref_img = None
+            self.cmd_vel.publish(Twist())
+            return True  # exit tick
+
+        # APPROACH → SEEK: target lost — revert inference to nogoal exploration.
+        if old_state == NavState.APPROACH and new_state == NavState.SEEK:
+            with self._infer_lock:
+                self._infer_mode = "nogoal"
+                self._infer_ref_img = None
+            logger.info("NavDP: target lost in APPROACH → SEEK (nogoal)")
+
+        return False
+
+    def _tick_read_trajectory(self, ctx: "_TickContext") -> bool:
+        """Read the latest trajectory from the inference thread.
+
+        Populates ctx.traj, ctx.all_traj, ctx.all_vals, ctx.traj_age,
+        ctx.infer_mode.
+
+        If the trajectory is missing or stale, applies hold/decel/stop logic,
+        publishes cmd_vel, and returns False (tick done).  Returns True when a
+        fresh trajectory is available and the tick should continue.
+        """
+        nb = _navdp_bridge
+        NavState = nb["NavState"]
+
         with self._infer_lock:
-            traj = self._latest_traj
-            all_traj = self._latest_all_traj
-            all_vals = self._latest_all_vals
-            traj_age = time.time() - self._traj_timestamp if self._traj_timestamp > 0 else float("inf")
-            infer_mode_now = self._infer_mode
+            ctx.traj = self._latest_traj
+            ctx.all_traj = self._latest_all_traj
+            ctx.all_vals = self._latest_all_vals
+            ctx.traj_age = (
+                time.time() - self._traj_timestamp
+                if self._traj_timestamp > 0
+                else float("inf")
+            )
+            ctx.infer_mode = self._infer_mode
+        self._last_infer_mode = ctx.infer_mode
 
         sm_state = self._state_machine.state if self._state_machine else NavState.SEEK
 
         # --- Handle missing or stale trajectory (graceful network failure) ---
-        if traj is None or traj_age > (self._hold_duration_s + self._decel_duration_s):
-            # No trajectory has arrived yet OR network has been down too long —
-            # apply hold/decel logic using last known good velocity.
+        if ctx.traj is None or ctx.traj_age > (
+            self._hold_duration_s + self._decel_duration_s
+        ):
             now = time.time()
-            age_since_good = now - self._last_good_time if self._last_good_time > 0 else float("inf")
-
+            age_since_good = (
+                now - self._last_good_time if self._last_good_time > 0 else float("inf")
+            )
             if age_since_good <= self._hold_duration_s:
-                # Within hold window: maintain last good velocity
-                v = self._last_good_v
-                w = self._last_good_w
+                ctx.v = self._last_good_v
+                ctx.w = self._last_good_w
                 if now - self._last_diag_time > self._diag_interval:
                     self._last_diag_time = now
                     logger.warning(
                         "NavDP: no fresh trajectory (age=%.2fs) — holding v=%.2f w=%.2f",
-                        traj_age, v, w,
+                        ctx.traj_age,
+                        ctx.v,
+                        ctx.w,
                     )
             elif age_since_good <= self._hold_duration_s + self._decel_duration_s:
-                # Within decel window: ramp velocity linearly to zero
                 elapsed_decel = age_since_good - self._hold_duration_s
                 scale = max(0.0, 1.0 - elapsed_decel / self._decel_duration_s)
-                v = self._last_good_v * scale
-                w = self._last_good_w * scale
+                ctx.v = self._last_good_v * scale
+                ctx.w = self._last_good_w * scale
                 if now - self._last_diag_time > self._diag_interval:
                     self._last_diag_time = now
                     logger.warning(
                         "NavDP: no fresh trajectory (age=%.2fs) — decelerating scale=%.2f",
-                        traj_age, scale,
+                        ctx.traj_age,
+                        scale,
                     )
             else:
-                # Beyond hold+decel window — full stop
-                v = 0.0
-                w = 0.0
+                ctx.v = 0.0
+                ctx.w = 0.0
                 self._inference_fail_count += 1
                 if now - self._last_diag_time > self._diag_interval:
                     self._last_diag_time = now
                     print(
-                        f"[NavDP] no fresh trajectory for {traj_age:.1f}s "
+                        f"[NavDP] no fresh trajectory for {ctx.traj_age:.1f}s "
                         f"({self._inference_fail_count} consecutive). "
                         f"sm={sm_state.name if hasattr(sm_state, 'name') else sm_state}, "
                         f"server={self._navdp_url}",
@@ -1218,44 +1428,65 @@ class NavDPNavigator(Module, NavigationInterface):
                         "NavDP: no fresh trajectory (%d consecutive). "
                         "State=%s, server=%s. Is the NavDP server running?",
                         self._inference_fail_count,
-                        sm_state.name if hasattr(sm_state, 'name') else sm_state,
+                        sm_state.name if hasattr(sm_state, "name") else sm_state,
                         self._navdp_url,
                     )
-
-            twist = Twist(
-                linear=Vector3(x=float(v), y=0.0, z=0.0),
-                angular=Vector3(x=0.0, y=0.0, z=float(w)),
+            self.cmd_vel.publish(
+                Twist(
+                    linear=Vector3(x=float(ctx.v), y=0.0, z=0.0),
+                    angular=Vector3(x=0.0, y=0.0, z=float(ctx.w)),
+                )
             )
-            self.cmd_vel.publish(twist)
-            return
+            return False  # trajectory handled, tick done
 
         self._inference_fail_count = 0
 
-        # --- Log trajectory info ---
+        # --- Log trajectory diagnostics ---
         now = time.time()
         if now - self._last_diag_time > self._diag_interval:
             self._last_diag_time = now
-            n_candidates = all_traj.shape[0] if all_traj is not None and all_traj.ndim == 3 else 0
-            best_val = float(all_vals.max()) if all_vals is not None and all_vals.size > 0 else 0.0
+            n_candidates = (
+                ctx.all_traj.shape[0]
+                if ctx.all_traj is not None and ctx.all_traj.ndim == 3
+                else 0
+            )
+            best_val = (
+                float(ctx.all_vals.max())
+                if ctx.all_vals is not None and ctx.all_vals.size > 0
+                else 0.0
+            )
             logger.info(
                 "NavDP trajectory: mode=%s, selected_shape=%s, "
                 "candidates=%d, best_score=%.3f, traj_range=[%.3f, %.3f], age=%.0fms",
-                infer_mode_now, traj.shape, n_candidates, best_val,
-                float(traj.min()), float(traj.max()), traj_age * 1000,
+                ctx.infer_mode,
+                ctx.traj.shape,
+                n_candidates,
+                best_val,
+                float(ctx.traj.min()),
+                float(ctx.traj.max()),
+                ctx.traj_age * 1000,
             )
 
+        return True
+
+    def _tick_select_trajectory(self, ctx: "_TickContext") -> None:
+        """Run the trajectory selector (when enabled) and convert to (v, w).
+
+        Populates ctx.waypoints, ctx.v, ctx.w.
+        """
+        traj = ctx.traj  # may be replaced by selector result
+
         # --- Trajectory selection (costmap / LiDAR collision avoidance) ---
-        waypoints = None  # set by selector or computed below
         if (
             self._trajectory_selector.enabled
-            and all_traj is not None
-            and odom is not None
+            and ctx.all_traj is not None
+            and ctx.odom is not None
         ):
-            if not getattr(self, '_traj_sel_logged', False):
+            if not getattr(self, "_traj_sel_logged", False):
                 self._traj_sel_logged = True
                 print(
                     f"[NavDP] TrajectorySelector ACTIVE: "
-                    f"all_traj={all_traj.shape}, "
+                    f"all_traj={ctx.all_traj.shape}, "
                     f"costmap={'yes' if self._latest_costmap is not None else 'NO'}, "
                     f"scan_pts={'yes' if self._latest_scan_points is not None else 'NO'}",
                     flush=True,
@@ -1264,47 +1495,59 @@ class NavDPNavigator(Module, NavigationInterface):
                 costmap = self._latest_costmap
                 scan_pts = self._latest_scan_points
 
-            # Determine SEEK state and build explored positions for
-            # the exploration cost (penalise revisiting known areas).
+            # Build explored-positions array for exploration cost (SEEK only).
             _NavState = _navdp_bridge["NavState"] if _navdp_bridge else None
             _is_seeking = (
                 _NavState is not None
                 and self._state_machine is not None
                 and self._state_machine.state == _NavState.SEEK
             )
-            _explored_pos = None
-            if _is_seeking and self._explore_trail:
-                _explored_pos = np.array(self._explore_trail, dtype=np.float32)
+            _explored_pos = (
+                np.array(self._explore_trail, dtype=np.float32)
+                if _is_seeking and self._explore_trail
+                else None
+            )
 
             sel_result = self._trajectory_selector.select(
                 selected_traj=traj,
-                all_trajectories=all_traj,
-                all_values=all_vals,
-                odom=odom,
+                all_trajectories=ctx.all_traj,
+                all_values=ctx.all_vals,
+                odom=ctx.odom,
                 traj_to_waypoints_fn=self._traj_ctrl.trajectory_to_waypoints,
                 costmap=costmap,
                 scan_points=scan_pts,
                 explored_positions=_explored_pos,
                 is_seeking=_is_seeking,
-                depth_image=sm_depth,
+                depth_image=ctx.sm_depth,
+                object_direction=self._object_direction,
             )
             if sel_result.fallback_used:
-                # All trajectories collide — set zero velocity but do NOT
-                # return early.  Let the tick continue so that stuck detection
-                # and escape rotation can still fire.
-                v = 0.0
-                w = 0.0
-                waypoints = np.zeros((0, 2), dtype=np.float32)
+                self._selector_halt_streak += 1
+                # All trajectories collide — zero velocity but do NOT return
+                # early so stuck detection and escape rotation can still fire.
+                ctx.v = 0.0
+                ctx.w = 0.0
+                ctx.waypoints = np.zeros((0, 2), dtype=np.float32)
             else:
+                self._selector_halt_streak = 0
                 traj = sel_result.trajectory
-                waypoints = None  # compute below
+                ctx.waypoints = None  # recomputed below
 
-        # --- Convert camera-frame trajectory → base_link waypoints → velocity ---
-        if waypoints is None:
-            waypoints = self._traj_ctrl.trajectory_to_waypoints(traj)
-            v, w = self._traj_ctrl.fallback_proportional(waypoints)
+        # --- Convert camera-frame trajectory → base_link waypoints → (v, w) ---
+        if ctx.waypoints is None:
+            ctx.waypoints = self._traj_ctrl.trajectory_to_waypoints(traj)
+            ctx.v, ctx.w = self._traj_ctrl.fallback_proportional(ctx.waypoints)
 
-        # --- Check goal proximity (for pose goals, not language goals) ---
+    def _tick_escape_override(self, ctx: "_TickContext") -> bool:
+        """Apply LiDAR escape and odom-based stuck detection; may override ctx.v/w.
+
+        Also handles pose-goal proximity (language goals use the SM instead).
+        Returns True if the tick should exit early (pose goal reached).
+        """
+        nb = _navdp_bridge
+        odom = ctx.odom
+
+        # --- Check goal proximity (pose goals only; language goals use the SM) ---
         if self._goal_pose is not None:
             gx = self._goal_pose.position.x
             gy = self._goal_pose.position.y
@@ -1314,9 +1557,9 @@ class NavDPNavigator(Module, NavigationInterface):
                 self._nav_state = NavigationState.IDLE
                 self.cmd_vel.publish(Twist())
                 logger.info("NavDP goal reached (dist=%.2f)", dist)
-                return
+                return True
 
-        # --- Escape override (LiDAR-based, if available) ---
+        # --- Escape override (LiDAR-based, when available) ---
         if self._escape_state is not None and self._latest_scan_points is not None:
             esc_result = nb["escape_tick"](
                 state=self._escape_state,
@@ -1325,73 +1568,112 @@ class NavDPNavigator(Module, NavigationInterface):
                 navdp_has_viable=True,
             )
             if esc_result.get("action") == "escape":
-                # Override with escape velocity
                 goal_base = esc_result.get("goal_base", (0.0, 0.0))
                 angle = math.atan2(goal_base[1], goal_base[0])
-                v = 0.15 if abs(angle) < 0.5 else 0.0
-                w = max(-0.5, min(0.5, angle))
+                ctx.v = 0.15 if abs(angle) < 0.5 else 0.0
+                ctx.w = max(-0.5, min(0.5, angle))
 
         # --- Odom-based stuck detection (fallback when LiDAR is unavailable) ---
         now = time.time()
+        selector_stuck = self._selector_halt_streak >= 4
         if self._is_rotating_to_escape:
-            # Currently executing a rotation escape manoeuvre
             elapsed = now - self._stuck_rotate_start
             if elapsed < self._stuck_rotate_duration:
-                v = 0.0
-                w = 0.5  # rotate in place
+                ctx.v = 0.0
+                ctx.w = 0.5  # rotate in place
             else:
-                # Done rotating — clear history so we don't immediately
-                # re-trigger and let the policy try a new direction.
+                # Done rotating — clear history so the policy can try a new direction.
                 self._is_rotating_to_escape = False
                 self._odom_history.clear()
+                self._selector_halt_streak = 0
                 logger.info("NavDP stuck-escape rotation complete, resuming policy")
-        elif self._check_stuck(odom):
+        elif selector_stuck or self._check_stuck(odom):
             self._is_rotating_to_escape = True
             self._stuck_rotate_start = now
-            v = 0.0
-            w = 0.5
+            trigger_reason = "selector_halt_streak" if selector_stuck else "odom_progress"
+            ctx.v = 0.0
+            ctx.w = 0.5
             logger.info(
-                "NavDP stuck detected at (%.2f, %.2f) — rotating to escape",
-                odom[0], odom[1],
+                "NavDP stuck detected at (%.2f, %.2f) via %s — rotating to escape",
+                odom[0],
+                odom[1],
+                trigger_reason,
             )
 
-        # --- Publish cmd_vel FIRST (before visualization, so vis bugs can't block motion) ---
-        if not getattr(self, '_cmd_vel_logged', False):
+        return False
+
+    def _tick_publish(self, ctx: "_TickContext") -> None:
+        """Publish cmd_vel and navdp_path; track last-good velocity."""
+        # Log the very first successful cmd_vel for diagnostics
+        if not getattr(self, "_cmd_vel_logged", False):
             self._cmd_vel_logged = True
             print(
-                f"[NavDP] FIRST cmd_vel: v={v:.4f}, w={w:.4f}, "
-                f"waypoints={waypoints.shape if waypoints is not None else None}, "
-                f"first_wp={waypoints[0].tolist() if waypoints is not None and len(waypoints) > 0 else None}, "
-                f"traj[0]={traj[0,:3].tolist() if traj is not None and traj.ndim >= 2 else None}, "
+                f"[NavDP] FIRST cmd_vel: v={ctx.v:.4f}, w={ctx.w:.4f}, "
+                f"waypoints={ctx.waypoints.shape if ctx.waypoints is not None else None}, "
+                f"first_wp="
+                f"{ctx.waypoints[0].tolist() if ctx.waypoints is not None and len(ctx.waypoints) > 0 else None}, "
+                f"traj[0]="
+                f"{ctx.traj[0, :3].tolist() if ctx.traj is not None and ctx.traj.ndim >= 2 else None}, "
                 f"cmd_vel transport={getattr(self.cmd_vel, '_transport', 'MISSING')}",
                 flush=True,
             )
+
         twist = Twist(
-            linear=Vector3(x=float(v), y=0.0, z=0.0),
-            angular=Vector3(x=0.0, y=0.0, z=float(w)),
+            linear=Vector3(x=float(ctx.v), y=0.0, z=0.0),
+            angular=Vector3(x=0.0, y=0.0, z=float(ctx.w)),
         )
         self.cmd_vel.publish(twist)
-        # Track last good velocity for graceful network failure hold/decel
+        # Track last good velocity for graceful network-failure hold/decel
         self._last_good_v = float(twist.linear.x)
         self._last_good_w = float(twist.angular.z)
         self._last_good_time = time.time()
 
-        # --- Publish navdp_path for WebSocket 2D visualizer (lightweight, no Rerun) ---
+        # --- Publish navdp_path for WebSocket 2D visualizer (no Rerun overhead) ---
         try:
-            if waypoints is not None and len(waypoints) > 0:
-                ox, oy, oyaw = odom
+            if ctx.waypoints is not None and len(ctx.waypoints) > 0:
+                ox, oy, oyaw = ctx.odom
                 cos_yaw = math.cos(oyaw)
                 sin_yaw = math.sin(oyaw)
                 poses = []
-                for wp in waypoints:
+                for wp in ctx.waypoints:
                     wx = ox + cos_yaw * wp[0] - sin_yaw * wp[1]
                     wy = oy + sin_yaw * wp[0] + cos_yaw * wp[1]
                     poses.append(PoseStamped(position=[wx, wy, 0.0]))
                 self.navdp_path.publish(Path(poses=poses, frame_id="world"))
         except Exception as e:
-            if not getattr(self, '_path_pub_err_logged', False):
+            if not getattr(self, "_path_pub_err_logged", False):
                 self._path_pub_err_logged = True
                 print(f"[NavDP] navdp_path publish error: {e}", flush=True)
+
+    # ------------------------------------------------------------------
+    # _tick orchestrator
+    # ------------------------------------------------------------------
+
+    def _tick(self) -> None:
+        """Single control tick using the NavDP state machine.
+
+        State machine flow:
+            IDLE → (set_language_goal) → SEEK → (VLM found) → APPROACH → (depth < thresh) → STOPPED
+                                          ↑                      │
+                                          └──────────────────────┘ (lost target)
+        """
+        ctx = self._tick_guard_checks()
+        if ctx is None:
+            return
+
+        self._tick_vlm_detection(ctx)
+
+        if self._tick_state_machine_update(ctx):
+            return  # goal reached → STOPPED
+
+        if not self._tick_read_trajectory(ctx):
+            return  # stale/missing trajectory — hold/decel published
+
+        self._tick_select_trajectory(ctx)
+        if self._tick_escape_override(ctx):
+            return  # pose goal reached
+
+        self._tick_publish(ctx)
 
     # --- LiDAR injection (called by NavDPMemory or external module) ---
 
