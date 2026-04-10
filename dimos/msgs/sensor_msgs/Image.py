@@ -480,6 +480,9 @@ class Image(Timestamped):
     @classmethod
     def lcm_decode(cls, data: bytes, **kwargs: Any) -> Image:
         msg = LCMImage.lcm_decode(data)
+        # JPEG-in-LCM (JpegLcmTransport, ros2_dimos_lcm_bridge); not a raw pixel encoding.
+        if msg.encoding == "jpeg":
+            return cls.lcm_jpeg_decode(data)
         fmt, dtype, channels = _parse_lcm_encoding(msg.encoding)
         arr: np.ndarray[Any, Any] = np.frombuffer(msg.data, dtype=dtype)
         if channels == 1:
