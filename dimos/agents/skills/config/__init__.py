@@ -136,6 +136,15 @@ class CameraConfig:
     width: int = 640
     height: int = 480
     fps: int = 30
+    # ROS2 compressed-image topics (only used when this camera is selected
+    # and ros2_bridge is enabled in the blueprint).
+    ros2_rgb_topic: str = ""
+    ros2_depth_topic: str = ""
+    ros2_depth_scale: float = 1000.0  # divisor: raw uint16 → float32 metres
+    # LCM channel basenames for ``realsense_lcm`` (standalone ros2_dimos_lcm_bridge).
+    # Full channel = basename + "#sensor_msgs.CompressedImage" (JPEG RGB + PNG depth).
+    lcm_rgb_basename: str = "/dimos/realsense/rgb"
+    lcm_depth_basename: str = "/dimos/realsense/depth"
 
 
 @dataclass
@@ -144,8 +153,9 @@ class NavDPConfig:
     navdp_server_url: str = "http://192.168.2.109:8880"
     vlm_server_url: str = "http://192.168.2.109:8000"
     # Active camera profile name.  Must be a key in ``cameras`` below.
-    # "go2"           — built-in Go2 camera (sim + real VLM/VLN)
-    # "realsense_d435" — RealSense D435 for real-deployment NavDP trajectories
+    # "go2"             — built-in Go2 camera (sim + real VLM/VLN)
+    # "realsense_d435"  — RealSense via in-process ROS2CompressedImageBridge (needs rclpy)
+    # "realsense_lcm"   — RealSense via external ros2_dimos_lcm_bridge + LcmRealsenseRelay
     trajectory_camera: str = "go2"
     # Named camera profiles.  Loaded from the ``cameras:`` YAML section.
     # Each entry is a CameraConfig.  The active profile is selected by
@@ -196,7 +206,7 @@ class BlueprintConfig:
 
 
 @dataclass
-class SimulationConfig:
+class DeploymentConfig:
     enabled: bool = False
     vlm_prompt_prefix: str = (
         "IMPORTANT: This image is from a 3D simulation, NOT a real camera. "
@@ -206,6 +216,15 @@ class SimulationConfig:
         "shapes). Interpret objects by their SHAPE and POSITION, not by "
         "photorealistic appearance. A rectangular shape on legs is likely a "
         "desk or table. A shape with a seat and backrest is a chair.\n\n"
+    )
+    hardware_vlm_prompt_prefix: str = (
+        "This image is from a real robot camera (Unitree Go2 quadruped) in a "
+        "real indoor environment. The camera is mounted low (~30 cm above ground) "
+        "and tilted slightly downward. Objects appear from a low viewpoint — "
+        "furniture legs and the underside of tables are prominent. Lighting may "
+        "vary (shadows, glare, dim areas). Identify objects by their real-world "
+        "appearance. Be aware that the wide-angle lens may cause slight barrel "
+        "distortion near image edges.\n\n"
     )
 
 
@@ -217,7 +236,7 @@ class VLNTestConfig:
     navdp: NavDPConfig = field(default_factory=NavDPConfig)
     escape: EscapeConfig = field(default_factory=EscapeConfig)
     blueprint: BlueprintConfig = field(default_factory=BlueprintConfig)
-    simulation: SimulationConfig = field(default_factory=SimulationConfig)
+    deployment: DeploymentConfig = field(default_factory=DeploymentConfig)
 
 
 def _parse_navdp_config(raw: dict[str, Any]) -> NavDPConfig:
@@ -265,7 +284,7 @@ def load_vln_config(path: str | Path | None = None) -> VLNTestConfig:
         navdp=_parse_navdp_config(raw.get("navdp", {})),
         escape=EscapeConfig(**raw.get("escape", {})),
         blueprint=BlueprintConfig(**raw.get("blueprint", {})),
-        simulation=SimulationConfig(**raw.get("simulation", {})),
+        deployment=DeploymentConfig(**raw.get("deployment", {})),
     )
 
 
@@ -279,6 +298,6 @@ __all__ = [
     "TrajectorySelectorConfig",
     "EscapeConfig",
     "BlueprintConfig",
-    "SimulationConfig",
+    "DeploymentConfig",
     "load_vln_config",
 ]

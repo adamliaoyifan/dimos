@@ -12,40 +12,41 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""VLN Web Input — web interface with text input, image upload, and camera feed.
+"""VLN Web Input — web interface with text input, image upload, and camera feeds.
 
 Provides a browser-based UI at http://localhost:<port> where users can:
 - Type navigation goals as text  (e.g. "find the glasses box in CTO office")
 - Upload a reference image of the target object
-- See the live camera feed and navigation status
+- See Go2 camera, RealSense RGB, and RealSense depth (colormapped) feeds
+- See navigation status
 """
 
 from __future__ import annotations
 
 import base64
-import io
-import json
-from pathlib import Path
+from collections.abc import Iterator
 from threading import Thread
+import time
 from typing import Any
 
 import cv2
-import numpy as np
-import reactivex as rx
-from reactivex.disposable import Disposable
-from fastapi import FastAPI, File, Form, Request, UploadFile
+from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+import numpy as np
+from reactivex.disposable import Disposable
 import uvicorn
 
 from dimos.core.core import rpc
 from dimos.core.module import Module, ModuleConfig
-from dimos.core.stream import In, Out
+from dimos.core.stream import In
 from dimos.core.transport import pLCMTransport
-from dimos.msgs.sensor_msgs.Image import Image
+from dimos.msgs.sensor_msgs.Image import Image, ImageFormat
 from dimos.utils.logging_config import setup_logger
 
 logger = setup_logger()
+
+_DEPTH_CLIP_MAX_M = 6.0
 
 
 class VLNWebConfig(ModuleConfig):
@@ -58,13 +59,15 @@ class VLNWebInput(Module[VLNWebConfig]):
     Serves a page with:
     - Text input box for navigation goals
     - Image upload for reference target images
-    - Live camera feed from the robot
+    - Live Go2 camera, RealSense RGB, and RealSense depth (visualized) feeds
     - Navigation status display
     """
 
     default_config = VLNWebConfig
 
     color_image: In[Image]
+    realsense_image: In[Image]
+    realsense_depth: In[Image]
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
@@ -79,6 +82,8 @@ class VLNWebInput(Module[VLNWebConfig]):
         self._thread: Thread | None = None
         self._human_transport: pLCMTransport[str] | None = None
         self._latest_frame: np.ndarray | None = None
+        self._latest_realsense_frame: np.ndarray | None = None
+        self._latest_depth_frame: np.ndarray | None = None
         self._uploaded_image: np.ndarray | None = None
         self._status: str = "idle"
         self._setup_routes()
@@ -94,7 +99,6 @@ class VLNWebInput(Module[VLNWebConfig]):
             image: UploadFile | None = File(None),
         ) -> JSONResponse:
             """Accept a text goal and optional reference image."""
-            # Handle optional image upload
             if image and image.filename:
                 data = await image.read()
                 arr = np.frombuffer(data, np.uint8)
@@ -122,9 +126,25 @@ class VLNWebInput(Module[VLNWebConfig]):
 
         @self._app.get("/camera_feed")
         async def camera_feed() -> StreamingResponse:
-            """MJPEG stream of the robot camera."""
+            """MJPEG stream of the Go2 camera."""
             return StreamingResponse(
-                self._mjpeg_generator(),
+                self._mjpeg_go2(),
+                media_type="multipart/x-mixed-replace; boundary=frame",
+            )
+
+        @self._app.get("/realsense_feed")
+        async def realsense_feed() -> StreamingResponse:
+            """MJPEG stream of RealSense RGB."""
+            return StreamingResponse(
+                self._mjpeg_realsense(),
+                media_type="multipart/x-mixed-replace; boundary=frame",
+            )
+
+        @self._app.get("/depth_feed")
+        async def depth_feed() -> StreamingResponse:
+            """MJPEG stream of RealSense depth (colormapped)."""
+            return StreamingResponse(
+                self._mjpeg_depth(),
                 media_type="multipart/x-mixed-replace; boundary=frame",
             )
 
@@ -137,12 +157,28 @@ class VLNWebInput(Module[VLNWebConfig]):
             b64 = base64.b64encode(buf.tobytes()).decode()
             return JSONResponse({"image": f"data:image/jpeg;base64,{b64}"})
 
-    def _mjpeg_generator(self):  # type: ignore[no-untyped-def]
-        import time
-
+    def _mjpeg_go2(self) -> Iterator[bytes]:
         while True:
             if self._latest_frame is not None:
                 _, buf = cv2.imencode(".jpg", self._latest_frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n"
+            time.sleep(0.1)
+
+    def _mjpeg_realsense(self) -> Iterator[bytes]:
+        while True:
+            if self._latest_realsense_frame is not None:
+                _, buf = cv2.imencode(
+                    ".jpg", self._latest_realsense_frame, [cv2.IMWRITE_JPEG_QUALITY, 70]
+                )
+                yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n"
+            time.sleep(0.1)
+
+    def _mjpeg_depth(self) -> Iterator[bytes]:
+        while True:
+            if self._latest_depth_frame is not None:
+                _, buf = cv2.imencode(
+                    ".jpg", self._latest_depth_frame, [cv2.IMWRITE_JPEG_QUALITY, 70]
+                )
                 yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n"
             time.sleep(0.1)
 
@@ -151,6 +187,8 @@ class VLNWebInput(Module[VLNWebConfig]):
         super().start()
         self._human_transport = pLCMTransport("/human_input")
         self._disposables.add(Disposable(self.color_image.subscribe(self._on_image)))
+        self._disposables.add(Disposable(self.realsense_image.subscribe(self._on_realsense_image)))
+        self._disposables.add(Disposable(self.realsense_depth.subscribe(self._on_realsense_depth)))
 
         config = uvicorn.Config(
             self._app,
@@ -177,6 +215,26 @@ class VLNWebInput(Module[VLNWebConfig]):
         if hasattr(image, "data") and image.data is not None:
             self._latest_frame = cv2.cvtColor(image.data, cv2.COLOR_RGB2BGR)
 
+    def _on_realsense_image(self, image: Image) -> None:
+        if hasattr(image, "data") and image.data is not None:
+            self._latest_realsense_frame = cv2.cvtColor(image.data, cv2.COLOR_RGB2BGR)
+
+    def _on_realsense_depth(self, image: Image) -> None:
+        if not hasattr(image, "data") or image.data is None:
+            return
+        d = np.asarray(image.data)
+        if d.ndim == 3:
+            d = d[..., 0] if d.shape[-1] == 1 else cv2.cvtColor(d, cv2.COLOR_BGR2GRAY)
+
+        if image.format == ImageFormat.DEPTH16 or d.dtype == np.uint16:
+            d_m = d.astype(np.float32) / 1000.0
+        else:
+            d_m = d.astype(np.float32)
+
+        d_m = np.clip(d_m, 0.0, _DEPTH_CLIP_MAX_M)
+        norm = (d_m / _DEPTH_CLIP_MAX_M * 255.0).astype(np.uint8)
+        self._latest_depth_frame = cv2.applyColorMap(norm, cv2.COLORMAP_TURBO)
+
     def get_uploaded_image(self) -> np.ndarray | None:
         """Return the most recently uploaded reference image (BGR numpy array)."""
         return self._uploaded_image
@@ -194,12 +252,23 @@ _VLN_HTML = """<!DOCTYPE html>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: system-ui, -apple-system, sans-serif; background: #1a1a2e; color: #eee; }
-  .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+  .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
   h1 { text-align: center; margin-bottom: 20px; color: #00d4ff; font-size: 1.5rem; }
-  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  .cameras { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 20px; }
+  .cam-panel { background: #16213e; border-radius: 12px; padding: 16px; }
+  .cam-panel h2 { font-size: 0.95rem; color: #00d4ff; margin-bottom: 10px; }
+  .cam-panel .placeholder {
+    width: 100%; min-height: 200px; border-radius: 8px; background: #0f3460;
+    display: flex; align-items: center; justify-content: center; color: #666; font-size: 0.85rem;
+  }
+  .cam-panel img.feed {
+    width: 100%; border-radius: 8px; background: #000; min-height: 200px; object-fit: contain;
+    display: block;
+  }
+  .bottom { display: grid; grid-template-columns: 1fr; gap: 20px; }
+  @media (min-width: 900px) { .bottom { grid-template-columns: 1fr 1fr; } }
   .panel { background: #16213e; border-radius: 12px; padding: 20px; }
   .panel h2 { font-size: 1rem; color: #00d4ff; margin-bottom: 12px; }
-  #camera { width: 100%; border-radius: 8px; background: #000; min-height: 300px; }
   .input-group { margin-bottom: 12px; }
   .input-group label { display: block; font-size: 0.85rem; color: #aaa; margin-bottom: 4px; }
   input[type=text] {
@@ -223,19 +292,35 @@ _VLN_HTML = """<!DOCTYPE html>
   .actions { display: flex; gap: 8px; margin-top: 12px; }
   #log { margin-top: 12px; max-height: 200px; overflow-y: auto; font-size: 0.8rem; color: #888; }
   #log div { padding: 2px 0; border-bottom: 1px solid #1a1a2e; }
-  @media (max-width: 768px) { .grid { grid-template-columns: 1fr; } }
+  @media (max-width: 900px) { .cameras { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
 <div class="container">
   <h1>VLN Navigation Interface</h1>
-  <div class="grid">
-    <div class="panel">
-      <h2>Camera Feed</h2>
-      <img id="camera" src="/camera_feed" alt="Camera feed">
+  <div class="cameras">
+    <div class="cam-panel">
+      <h2>Go2 camera</h2>
+      <img class="feed" id="cam-go2" src="/camera_feed" alt="Go2 camera"
+           onerror="this.style.display='none'; document.getElementById('ph-go2').style.display='flex';">
+      <div class="placeholder" id="ph-go2" style="display:none">Waiting for feed…</div>
     </div>
+    <div class="cam-panel">
+      <h2>RealSense RGB</h2>
+      <img class="feed" id="cam-rs" src="/realsense_feed" alt="RealSense RGB"
+           onerror="this.style.display='none'; document.getElementById('ph-rs').style.display='flex';">
+      <div class="placeholder" id="ph-rs" style="display:none">Waiting for feed…</div>
+    </div>
+    <div class="cam-panel">
+      <h2>RealSense depth</h2>
+      <img class="feed" id="cam-depth" src="/depth_feed" alt="RealSense depth"
+           onerror="this.style.display='none'; document.getElementById('ph-depth').style.display='flex';">
+      <div class="placeholder" id="ph-depth" style="display:none">Waiting for feed…</div>
+    </div>
+  </div>
+  <div class="bottom">
     <div class="panel">
-      <h2>Navigation Target</h2>
+      <h2>Navigation target</h2>
       <form id="nav-form" enctype="multipart/form-data">
         <div class="input-group">
           <label for="goal">Text goal</label>
@@ -252,6 +337,9 @@ _VLN_HTML = """<!DOCTYPE html>
           <button type="button" class="btn btn-stop" id="btn-stop">Stop</button>
         </div>
       </form>
+    </div>
+    <div class="panel">
+      <h2>Status</h2>
       <div id="status"><span class="label">Status:</span> <span id="status-text">idle</span></div>
       <div id="log"></div>
     </div>

@@ -19,27 +19,47 @@ Reads all configuration from ``dimos/agents/skills/config/vln_config.yaml``
 (or a custom path via ``VLN_CONFIG`` env var).
 
 Provides two web interfaces:
-    - http://localhost:5556  VLN interface (text goal + image upload + camera feed)
+    - http://localhost:5556  VLN interface (text goal + image upload + Go2 / RealSense RGB / depth feeds)
     - http://localhost:7779  WebSocket visualization (map + costmap)
 
 Usage:
+    # Simulation (MuJoCo):
     dimos --simulation run unitree-go2-vln-local
 
+    # Real Go2 hardware:
+    dimos run unitree-go2-vln-local --robot-ip 192.168.123.161
+
+    # Real hardware with RealSense D435 for NavDP trajectories:
+    #   realsense_d435 — in-process ROS bridge (needs rclpy in DimOS env), or
+    #   realsense_lcm — run ros2_dimos_lcm_bridge under ROS 2, then DimOS (e.g. Py 3.14).
+    dimos run unitree-go2-vln-local --robot-ip 192.168.123.161
+
     # With custom config:
-    VLN_CONFIG=/path/to/my_config.yaml dimos --simulation run unitree-go2-vln-local
+    VLN_CONFIG=/path/to/my_config.yaml dimos run unitree-go2-vln-local --robot-ip 192.168.123.161
+
+Hardware checklist (edit vln_config.yaml before running on real robot):
+    simulation.enabled: false   ← disables 3D-render VLM prompt prefix
+    navdp.trajectory_camera: go2 | realsense_d435 | realsense_lcm
+    vlm.base_url: http://<server>:8000
+    agent.ollama_base_url: http://<server>:11434
+    navdp.navdp_server_url: http://<server>:8880
 """
 
 # ── IMPORTANT: set OLLAMA_HOST before any ollama imports ─────────────
 import os
+
 from dimos.agents.skills.config import load_vln_config
 
 cfg = load_vln_config(os.environ.get("VLN_CONFIG"))
 os.environ["OLLAMA_HOST"] = cfg.agent.ollama_base_url
 # ─────────────────────────────────────────────────────────────────────
 
+from dimos_lcm.sensor_msgs.CompressedImage import CompressedImage
+
 from dimos.agents.mcp.mcp_client import McpClient
 from dimos.agents.mcp.mcp_server import McpServer
 from dimos.agents.ollama_agent import ollama_installed
+
 # from dimos.agents.skills.escape_skill import EscapeSkillContainer
 from dimos.agents.skills.navigation import NavigationSkillContainer
 from dimos.agents.skills.person_follow import PersonFollowSkillContainer
@@ -47,8 +67,12 @@ from dimos.agents.skills.speak_skill import SpeakSkill
 from dimos.agents.skills.vln_skill import VLNSkillContainer
 from dimos.agents.skills.vln_web_input import VLNWebInput
 from dimos.core.blueprints import autoconnect
-from dimos.robot.unitree.go2.connection import GO2Connection
+from dimos.core.transport import LCMTransport, pSHMTransport
+from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
+from dimos.msgs.geometry_msgs.Twist import Twist
+from dimos.msgs.sensor_msgs.Image import Image
 from dimos.robot.unitree.go2.blueprints.smart.unitree_go2_spatial import unitree_go2_spatial
+from dimos.robot.unitree.go2.connection import GO2Connection
 from dimos.robot.unitree.unitree_skill_container import UnitreeSkillContainer
 
 # ── VLN system prompt ────────────────────────────────────────────────
@@ -123,8 +147,58 @@ When navigation fails or the robot stops making progress:
   is stuck for several seconds it will auto-escape without agent intervention.
 """
 
-# ── Simulation prompt prefix (empty string for real-world) ────────────
-_sim_prefix = cfg.simulation.vlm_prompt_prefix if cfg.simulation.enabled else ""
+# ── VLM prompt prefix: simulation context or real-hardware context ─────
+_sim_prefix = (
+    cfg.deployment.vlm_prompt_prefix
+    if cfg.deployment.enabled
+    else cfg.deployment.hardware_vlm_prompt_prefix
+)
+
+# NavDP trajectory camera (VLN web RealSense feeds when using RealSense pSHM paths)
+_is_realsense_ros = cfg.navdp.trajectory_camera == "realsense_d435"
+_is_realsense_lcm = cfg.navdp.trajectory_camera == "realsense_lcm"
+_uses_realsense_shm = _is_realsense_ros or _is_realsense_lcm
+_vln_web_blueprint = VLNWebInput.blueprint(port=5556)
+if _uses_realsense_shm:
+    _vln_web_blueprint = _vln_web_blueprint.transports(
+        {
+            ("realsense_image", Image): pSHMTransport("realsense_image"),
+            ("realsense_depth", Image): pSHMTransport("realsense_depth"),
+        }
+    )
+
+
+def _realsense_ros2_client_installed() -> str | None:
+    """Fail fast before workers start if ROS2CompressedImageBridge cannot import deps."""
+    if not cfg.navdp.enabled or not _is_realsense_ros:
+        return None
+    try:
+        import rclpy  # noqa: F401
+        from sensor_msgs.msg import CompressedImage  # noqa: F401
+    except ImportError:
+        return (
+            "navdp.trajectory_camera is realsense_d435 but rclpy/sensor_msgs are not importable. "
+            "Install ROS 2 Python packages for this environment, or set "
+            "navdp.trajectory_camera: go2 in vln_config.yaml to use the Go2 camera only."
+        )
+    return None
+
+
+def _realsense_lcm_relay_ready() -> str | None:
+    """Fail fast if LcmRealsenseRelay cannot subscribe/decode LCM CompressedImage."""
+    if not cfg.navdp.enabled or not _is_realsense_lcm:
+        return None
+    try:
+        import cv2  # noqa: F401
+        import lcm  # noqa: F401
+        import numpy as np  # noqa: F401
+    except ImportError:
+        return (
+            "navdp.trajectory_camera is realsense_lcm but lcm and/or OpenCV/NumPy are not importable. "
+            "Install them in the DimOS environment, or use realsense_d435 with rclpy, or trajectory_camera: go2."
+        )
+    return None
+
 
 # ── Skills (conditionally include TTS) ───────────────────────────────
 _skill_blueprints = [
@@ -136,7 +210,6 @@ _skill_blueprints = [
     ),
     PersonFollowSkillContainer.blueprint(camera_info=GO2Connection.camera_info_static),
     UnitreeSkillContainer.blueprint(),
-    VLNWebInput.blueprint(port=5556),  # VLN web UI with image upload
 ]
 if cfg.blueprint.enable_tts:
     _skill_blueprints.append(SpeakSkill.blueprint())
@@ -157,17 +230,13 @@ _local_skills = autoconnect(*_skill_blueprints)
 # ) if cfg.escape.enabled else None
 
 # ── Camera config (always resolved — used for VLNSkillContainer + NavDP) ─────
+from typing import Any
+
 import numpy as np
-from dimos.core.transport import pSHMTransport
-from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
-from dimos.msgs.geometry_msgs.Twist import Twist
-from dimos.msgs.sensor_msgs.Image import Image
 
 _traj_cam = cfg.navdp.get_trajectory_camera()
 _cam_intrinsic_np = (
-    np.array(_traj_cam.intrinsic, dtype=np.float32)
-    if _traj_cam.intrinsic is not None
-    else None
+    np.array(_traj_cam.intrinsic, dtype=np.float32) if _traj_cam.intrinsic is not None else None
 )
 # Pass as native Python list (not numpy array) for ModuleConfig serialisation
 _cam_intrinsic_list = _traj_cam.intrinsic  # list[list[float]] | None
@@ -176,7 +245,7 @@ _cam_intrinsic_list = _traj_cam.intrinsic  # list[list[float]] | None
 _navdp_blueprints = []
 if cfg.navdp.enabled:
     from dimos.core.blueprints import autoconnect as _autoconnect
-    from dimos.navigation.navdp import navdp_navigator, navdp_memory, navdp_skills
+    from dimos.navigation.navdp import navdp_memory, navdp_navigator, navdp_skills
 
     _cam_intrinsic = _cam_intrinsic_np
 
@@ -187,15 +256,56 @@ if cfg.navdp.enabled:
     # In simulation (or any single-camera setup) both stream names resolve to
     # the same pSHM channel, so the navigator transparently falls back to
     # color_image / depth_image for inference.
-    _is_realsense = cfg.navdp.trajectory_camera == "realsense_d435"
-    _navdp_image_transport = (
-        pSHMTransport("realsense_image") if _is_realsense else pSHMTransport("color_image")
+    _navdp_image_transport: pSHMTransport[Any] = (
+        pSHMTransport("realsense_image") if _uses_realsense_shm else pSHMTransport("color_image")
     )
-    _navdp_depth_transport = (
-        pSHMTransport("realsense_depth") if _is_realsense else pSHMTransport("depth_image")
+    _navdp_depth_transport: pSHMTransport[Any] = (
+        pSHMTransport("realsense_depth") if _uses_realsense_shm else pSHMTransport("depth_image")
     )
 
-    _navdp_blueprints = [
+    # RealSense → pSHM: either in-process ROS2 or external ROS2 + LCM relay.
+    if _is_realsense_ros:
+        from dimos.hardware.sensors.camera.ros2_compressed_bridge import (
+            ROS2CompressedImageBridge,
+        )
+
+        # Remap bridge Out stream names so global transport_map ("color_image", Image)
+        # from NavDP/VLN does not overwrite the bridge's SHM channels (see autoconnect merge).
+        _navdp_blueprints.append(
+            ROS2CompressedImageBridge.blueprint(
+                rgb_topic=_traj_cam.ros2_rgb_topic,
+                depth_topic=_traj_cam.ros2_depth_topic,
+                depth_scale=_traj_cam.ros2_depth_scale,
+            ).remappings(
+                [
+                    (ROS2CompressedImageBridge, "color_image", "realsense_image"),
+                    (ROS2CompressedImageBridge, "depth_image", "realsense_depth"),
+                ]
+            )
+        )
+    elif _is_realsense_lcm:
+        from dimos.hardware.sensors.camera.lcm_realsense_relay import LcmRealsenseRelay
+
+        _navdp_blueprints.append(
+            LcmRealsenseRelay.blueprint(
+                lcm_rgb_basename=_traj_cam.lcm_rgb_basename,
+                lcm_depth_basename=_traj_cam.lcm_depth_basename,
+                depth_scale=_traj_cam.ros2_depth_scale,
+            ).transports(
+                {
+                    ("rgb_ingress", CompressedImage): LCMTransport(
+                        _traj_cam.lcm_rgb_basename, CompressedImage
+                    ),
+                    ("depth_ingress", CompressedImage): LCMTransport(
+                        _traj_cam.lcm_depth_basename, CompressedImage
+                    ),
+                    ("realsense_image", Image): pSHMTransport("realsense_image"),
+                    ("realsense_depth", Image): pSHMTransport("realsense_depth"),
+                }
+            )
+        )
+
+    _navdp_blueprints.append(
         _autoconnect(
             navdp_navigator(
                 navdp_server_url=cfg.navdp.navdp_server_url,
@@ -216,9 +326,7 @@ if cfg.navdp.enabled:
                 enable_internal_vlm=cfg.navdp.enable_internal_vlm,
                 trajectory_selector_enabled=cfg.navdp.trajectory_selector.enabled,
                 trajectory_selector_kwargs={
-                    k: v
-                    for k, v in vars(cfg.navdp.trajectory_selector).items()
-                    if k != "enabled"
+                    k: v for k, v in vars(cfg.navdp.trajectory_selector).items() if k != "enabled"
                 },
             ),
             navdp_memory(
@@ -230,16 +338,18 @@ if cfg.navdp.enabled:
                 landmark_time_thresh_s=cfg.navdp.landmark_time_thresh_s,
             ),
             navdp_skills(),
-        ).transports({
-            ("color_image", Image): pSHMTransport("color_image"),
-            ("navdp_image", Image): _navdp_image_transport,
-            ("depth_image", Image): pSHMTransport("depth_image"),
-            ("navdp_depth", Image): _navdp_depth_transport,
-            ("topdown_map", Image): pSHMTransport("topdown_map"),
-            ("odom", PoseStamped): pSHMTransport("odom"),
-            ("cmd_vel", Twist): pSHMTransport("cmd_vel"),
-        })
-    ]
+        ).transports(
+            {
+                ("color_image", Image): pSHMTransport("color_image"),
+                ("navdp_image", Image): _navdp_image_transport,
+                ("depth_image", Image): pSHMTransport("depth_image"),
+                ("navdp_depth", Image): _navdp_depth_transport,
+                ("topdown_map", Image): pSHMTransport("topdown_map"),
+                ("odom", PoseStamped): pSHMTransport("odom"),
+                ("cmd_vel", Twist): pSHMTransport("cmd_vel"),
+            }
+        )
+    )
 
 # ── Compose blueprint ────────────────────────────────────────────────
 _all_components = [
@@ -250,6 +360,7 @@ _all_components = [
         system_prompt=VLN_SYSTEM_PROMPT,
     ),
     _local_skills,
+    _vln_web_blueprint,
     VLNSkillContainer.blueprint(
         # VLM
         vlm_backend=cfg.vlm.backend,
@@ -283,11 +394,13 @@ _all_components = [
         cam_y=_traj_cam.y,
         cam_z=_traj_cam.z,
         cam_pitch=_traj_cam.pitch,
-    ).transports({
-        ("depth_image", Image): pSHMTransport("depth_image"),
-        ("color_image", Image): pSHMTransport("color_image"),
-        ("odom", PoseStamped): pSHMTransport("odom"),
-    }),
+    ).transports(
+        {
+            ("depth_image", Image): pSHMTransport("depth_image"),
+            ("color_image", Image): pSHMTransport("color_image"),
+            ("odom", PoseStamped): pSHMTransport("odom"),
+        }
+    ),
 ]
 
 # if _escape_blueprint is not None:
@@ -295,12 +408,18 @@ _all_components = [
 
 _all_components.extend(_navdp_blueprints)
 
-unitree_go2_vln_local = autoconnect(
-    *_all_components,
-).global_config(
-    n_workers=cfg.blueprint.n_workers,
-).requirements(
-    ollama_installed,
+unitree_go2_vln_local = (
+    autoconnect(
+        *_all_components,
+    )
+    .global_config(
+        n_workers=cfg.blueprint.n_workers,
+    )
+    .requirements(
+        ollama_installed,
+        _realsense_ros2_client_installed,
+        _realsense_lcm_relay_ready,
+    )
 )
 
 __all__ = ["unitree_go2_vln_local"]

@@ -61,9 +61,10 @@ navdp:
   vlm_server_url: http://192.168.2.109:8000
 
   # Active trajectory camera profile.  Must match a key in ``cameras:`` below.
-  # Use "go2" in simulation; use "realsense_d435" in real deployment when the
-  # RealSense is mounted and wired to the navdp_image / navdp_depth streams.
-  trajectory_camera: go2
+  # Use "go2" in simulation.
+  # "realsense_d435" — in-process ROS2 bridge (requires rclpy in DimOS Python).
+  # "realsense_lcm" — run ros2_dimos_lcm_bridge under ROS 2, then DimOS (e.g. Python 3.14).
+  trajectory_camera: realsense_lcm
 
   # Camera profiles — add or override entries here.
   # Each entry becomes a CameraConfig that can be selected via trajectory_camera.
@@ -97,6 +98,27 @@ navdp:
       width: 640
       height: 480
       fps: 30
+      # ROS2 compressed topics published by the edge compressor node
+      ros2_rgb_topic: /camera/camera/color/image_raw/compressed
+      ros2_depth_topic: /camera/camera/aligned_depth_to_color/image_raw/compressed
+      ros2_depth_scale: 1000.0   # uint16 mm → float32 metres
+
+    # Same RealSense geometry as realsense_d435; images arrive via LCM from
+    # ``ros2_dimos_lcm_bridge`` (see ros2_dimos_lcm_bridge/README.md).
+    realsense_lcm:
+      intrinsic:
+        - [614.0, 0.0, 320.0]
+        - [0.0, 614.0, 240.0]
+        - [0.0, 0.0, 1.0]
+      x: 0.15
+      y: 0.00
+      z: 0.28
+      pitch: 0.10
+      width: 640
+      height: 480
+      fps: 30
+      lcm_rgb_basename: /dimos/realsense/rgb
+      lcm_depth_basename: /dimos/realsense/depth
 
   # Graceful network-failure: hold last velocity then decelerate to zero.
   # Trajectories are in local frame — they CANNOT be replayed after the
@@ -156,12 +178,13 @@ blueprint:
   enable_tts: false
   n_workers: 8
 
-# ── Simulation ──────────────────────────────────────────────────────
-# Set enabled: true when running in simulation (dimos --simulation)
-# The vlm_prompt_prefix is prepended to EVERY VLM query to help the model
-# understand that images are 3D-rendered, not real photos.
-simulation:
-  enabled: true
+# ── Deployment mode ─────────────────────────────────────────────────
+# Set enabled: true when running in simulation (dimos --simulation).
+# Set enabled: false for real Go2 hardware deployment.
+# vlm_prompt_prefix is prepended to EVERY VLM query in simulation mode.
+# hardware_vlm_prompt_prefix is used instead when simulation is disabled.
+deployment:
+  enabled: false  # ← change to false for real hardware
   vlm_prompt_prefix: >-
     IMPORTANT: This image is from a 3D simulation, NOT a real camera.
     The scene uses simple 3D-rendered graphics with flat shading, basic
@@ -170,3 +193,11 @@ simulation:
     shapes). Interpret objects by their SHAPE and POSITION, not by
     photorealistic appearance. A rectangular shape on legs is likely a
     desk or table. A shape with a seat and backrest is a chair.
+  hardware_vlm_prompt_prefix: >-
+    This image is from a real robot camera (Unitree Go2 quadruped) in a
+    real indoor environment. The camera is mounted low (~30 cm above
+    ground) and tilted slightly downward. Objects appear from a low
+    viewpoint — furniture legs and the underside of tables are prominent.
+    Lighting may vary (shadows, glare, dim areas). Identify objects by
+    their real-world appearance. Be aware that the wide-angle lens may
+    cause slight barrel distortion near image edges.
