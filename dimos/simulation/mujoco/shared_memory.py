@@ -22,7 +22,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
-from dimos.simulation.mujoco.constants import VIDEO_HEIGHT, VIDEO_WIDTH
+from dimos.simulation.mujoco.constants import D435I_HEIGHT, D435I_WIDTH, VIDEO_HEIGHT, VIDEO_WIDTH
 from dimos.utils.logging_config import setup_logger
 
 logger = setup_logger()
@@ -31,6 +31,9 @@ logger = setup_logger()
 _video_size = VIDEO_WIDTH * VIDEO_HEIGHT * 3
 # Depth buffers: 3 cameras x VIDEO_WIDTH x VIDEO_HEIGHT float32
 _depth_size = VIDEO_WIDTH * VIDEO_HEIGHT * 4  # float32 = 4 bytes
+# D435i buffers: D435I_WIDTH x D435I_HEIGHT (640x480)
+_d435i_video_size = D435I_WIDTH * D435I_HEIGHT * 3
+_d435i_depth_size = D435I_WIDTH * D435I_HEIGHT * 4  # float32
 # Odometry buffer: position(3) + quaternion(4) + timestamp(1) = 8 floats
 _odom_size = 8 * 8  # 8 float64 values
 # Command buffer: linear(3) + angular(3) = 6 floats
@@ -48,6 +51,8 @@ _shm_sizes = {
     "depth_left": _depth_size,
     "depth_right": _depth_size,
     "head_depth": _depth_size,
+    "d435i_video": _d435i_video_size,
+    "d435i_depth": _d435i_depth_size,
     "odom": _odom_size,
     "cmd": _cmd_size,
     "lidar": _lidar_size,
@@ -72,6 +77,8 @@ class ShmSet:
     depth_left: SharedMemory
     depth_right: SharedMemory
     head_depth: SharedMemory
+    d435i_video: SharedMemory
+    d435i_depth: SharedMemory
     odom: SharedMemory
     cmd: SharedMemory
     lidar: SharedMemory
@@ -148,6 +155,20 @@ class ShmReader:
         )
         depth_array[:] = depth
         self._increment_seq(5)
+
+    def write_d435i_video(self, pixels: NDArray[Any]) -> None:
+        video_array: NDArray[Any] = np.ndarray(
+            (D435I_HEIGHT, D435I_WIDTH, 3), dtype=np.uint8, buffer=self.shm.d435i_video.buf
+        )
+        video_array[:] = pixels
+        self._increment_seq(6)
+
+    def write_d435i_depth(self, depth: NDArray[Any]) -> None:
+        depth_array: NDArray[Any] = np.ndarray(
+            (D435I_HEIGHT, D435I_WIDTH), dtype=np.float32, buffer=self.shm.d435i_depth.buf
+        )
+        depth_array[:] = depth
+        self._increment_seq(7)
 
     def write_odom(self, pos: NDArray[Any], quat: NDArray[Any], timestamp: float) -> None:
         odom_array: NDArray[Any] = np.ndarray((8,), dtype=np.float64, buffer=self.shm.odom.buf)
@@ -249,6 +270,24 @@ class ShmWriter:
         if seq > 0:
             depth_array: NDArray[Any] = np.ndarray(
                 (VIDEO_HEIGHT, VIDEO_WIDTH), dtype=np.float32, buffer=self.shm.head_depth.buf
+            )
+            return depth_array.copy(), seq
+        return None, 0
+
+    def read_d435i_video(self) -> tuple[NDArray[Any] | None, int]:
+        seq = self._get_seq(6)
+        if seq > 0:
+            video_array: NDArray[Any] = np.ndarray(
+                (D435I_HEIGHT, D435I_WIDTH, 3), dtype=np.uint8, buffer=self.shm.d435i_video.buf
+            )
+            return video_array.copy(), seq
+        return None, 0
+
+    def read_d435i_depth(self) -> tuple[NDArray[Any] | None, int]:
+        seq = self._get_seq(7)
+        if seq > 0:
+            depth_array: NDArray[Any] = np.ndarray(
+                (D435I_HEIGHT, D435I_WIDTH), dtype=np.float32, buffer=self.shm.d435i_depth.buf
             )
             return depth_array.copy(), seq
         return None, 0

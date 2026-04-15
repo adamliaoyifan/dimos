@@ -1,0 +1,95 @@
+# Room layout for scene_house.xml MuJoCo simulation environment.
+#
+# Loaded into SpatialMemory at startup via VLNSkillContainer so the VLN skill
+# can navigate to named rooms immediately (without prior exploration).
+#
+# Coordinates are in map/world frame matching scene_house.xml geometry:
+#   House is 20m x 14m.  Origin (0,0) at south-west corner.
+#
+# Usage:
+#   Set in vln_config.yaml under deployment.room_layout, or export:
+#     export DIMOS_VLN_ROOM_LAYOUT=configs/sim/room_layout_house.yaml
+#
+# Run:
+#   dimos --simulation run unitree-go2-vln-local \
+#         --mujoco-room house \
+#         --mujoco-start-pos "10.0, 3.0"
+#
+# Scene diagram (top-down):
+#
+#       0      6           14     20
+#  14  +======+=====+=+====+======+
+#      |Master| Bath|L|  Guest BR |
+#      |  BR  | room|a|  (8x4)   |
+#      |(7x4) |(3x4)|u|          |
+#  10  +=D====+=D===+D+=====D====+
+#      |      |                  |
+#      |Dining|  OPEN HALLWAY    |Study
+#      |Room  |  (8m x 10m)     |(6x5)
+#      |(6x5) |                  |
+#   5  +=D====+  open plan      +=D====+
+#      |      |                  |      |
+#      |Living|  Go2 spawns     |Kitchen|
+#      |Room  |  at (10,3)      |(6x5) |
+#      |(6x5) |                  |      |
+#   0  +======+==================+======+
+#
+#  D = doorway (1.2m gap)
+
+rooms:
+  living_room:
+    x: 3.0
+    y: 2.5
+    description: "living room with sofa, coffee table, and TV"
+
+  dining_room:
+    x: 3.0
+    y: 7.5
+    description: "dining room with dining table and chairs"
+
+  kitchen:
+    x: 17.0
+    y: 2.5
+    description: "kitchen with counters, island, and fridge"
+
+  study:
+    x: 17.0
+    y: 7.5
+    description: "study room with desk, monitor, and bookshelf"
+
+  master_bedroom:
+    x: 3.5
+    y: 12.0
+    description: "master bedroom with king bed and wardrobe"
+
+  guest_bedroom:
+    x: 16.0
+    y: 12.0
+    description: "guest bedroom with bed and dresser"
+
+  bathroom:
+    x: 8.5
+    y: 12.0
+    description: "bathroom with bathtub and sink vanity"
+
+  hallway:
+    x: 10.0
+    y: 5.0
+    description: "central hallway connecting all rooms"
+
+doors:
+  living_room-hallway:   { x: 6.0,  y: 3.0  }
+  dining_room-hallway:   { x: 6.0,  y: 8.0  }
+  kitchen-hallway:       { x: 14.0, y: 3.0  }
+  study-hallway:         { x: 14.0, y: 8.0  }
+  living_room-dining_room: { x: 3.0, y: 5.0 }
+  kitchen-study:         { x: 17.0, y: 5.0  }
+  master_bedroom-hallway: { x: 3.0, y: 10.0 }
+  bathroom-hallway:      { x: 8.5,  y: 10.0 }
+  guest_bedroom-hallway: { x: 16.0, y: 10.0 }
+
+spawn:
+  default:
+    x: 10.0
+    y: 3.0
+    description: "hallway entrance — use --mujoco-start-pos '10.0, 3.0'"

@@ -1,0 +1,22 @@
+# Example VLN YAML fragments for MuJoCo — copy and customize.
+# Integration with `load_vln_config` / VLN_CONFIG depends on your DimOS revision.
+#
+# Full reference layouts may live in-tree as dimos/agents/skills/config/vln_config.yaml.
+
+# ── Deployment (simulation vs hardware VLM context) ─────────────────
+deployment:
+  enabled: true
+  vlm_prompt_prefix: >-
+    IMPORTANT: This image is from a 3D simulation, NOT a real camera.
+    Interpret objects by shape and layout; graphics are simplified.
+  hardware_vlm_prompt_prefix: >-
+    This image is from a real robot camera in a real indoor environment.
+
+# Point these at your local inference services (examples only):
+# vlm:
+#   base_url: http://127.0.0.1:8000
+# agent:
+#   ollama_base_url: http://127.0.0.1:11434
+# navdp:
+#   navdp_server_url: http://127.0.0.1:8880
+#   trajectory_camera: go2

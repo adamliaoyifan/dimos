@@ -31,6 +31,8 @@ import open3d as o3d  # type: ignore[import-untyped]
 from dimos.core.global_config import GlobalConfig
 from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
 from dimos.simulation.mujoco.constants import (
+    D435I_HEIGHT,
+    D435I_WIDTH,
     DEPTH_CAMERA_FOV,
     LIDAR_FPS,
     LIDAR_RESOLUTION,
@@ -77,7 +79,12 @@ def _run_simulation(config: GlobalConfig, shm: ShmReader) -> None:
         robot_name = "unitree_go1"
 
     controller = MockController(shm)
-    model, data = load_model(controller, robot=robot_name, scene_xml=load_scene_xml(config))
+    model, data = load_model(
+        controller,
+        robot=robot_name,
+        scene_xml=load_scene_xml(config),
+        scene_name=config.mujoco_room or "office1",
+    )
 
     if model is None or data is None:
         raise ValueError("Failed to load MuJoCo model: model or data is None")
@@ -99,12 +106,24 @@ def _run_simulation(config: GlobalConfig, shm: ShmReader) -> None:
     camera_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, "head_camera")
     lidar_camera_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, "lidar_front_camera")
 
-    person_position_controller = PersonPositionController(model)
+    person_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "person")
+    person_position_controller: PersonPositionController | None = (
+        PersonPositionController(model) if person_body_id >= 0 else None
+    )
 
     lidar_left_camera_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, "lidar_left_camera")
     lidar_right_camera_id = mujoco.mj_name2id(
         model, mujoco.mjtObj.mjOBJ_CAMERA, "lidar_right_camera"
     )
+    # Look up the RealSense camera by the name in GlobalConfig so d455i_rgbd or d435i_rgb
+    # can be selected via trajectory_camera in vln_config.yaml.
+    _realsense_cam_name = config.realsense_camera_name
+    d435i_camera_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, _realsense_cam_name)
+    if d435i_camera_id < 0:
+        logger.warning(
+            f"RealSense camera '{_realsense_cam_name}' not found in model, "
+            "RealSense rendering disabled."
+        )
 
     shm.signal_ready()
 
@@ -123,6 +142,12 @@ def _run_simulation(config: GlobalConfig, shm: ShmReader) -> None:
 
         depth_right_renderer = mujoco.Renderer(model, height=camera_size[1], width=camera_size[0])
         depth_right_renderer.enable_depth_rendering()
+
+        # D435i renderers (640x480)
+        d435i_size = (D435I_WIDTH, D435I_HEIGHT)
+        d435i_rgb_renderer = mujoco.Renderer(model, height=d435i_size[1], width=d435i_size[0])
+        d435i_depth_renderer = mujoco.Renderer(model, height=d435i_size[1], width=d435i_size[0])
+        d435i_depth_renderer.enable_depth_rendering()
 
         scene_option = mujoco.MjvOption()
 
@@ -144,7 +169,8 @@ def _run_simulation(config: GlobalConfig, shm: ShmReader) -> None:
             for _ in range(config.mujoco_steps_per_frame):
                 mujoco.mj_step(model, data)
 
-            person_position_controller.tick(data)
+            if person_position_controller is not None:
+                person_position_controller.tick(data)
 
             m_viewer.sync()
 
@@ -169,6 +195,20 @@ def _run_simulation(config: GlobalConfig, shm: ShmReader) -> None:
                 # Clip to 10m max (RealSense-like range)
                 head_depth_metric = np.clip(head_depth_metric, 0.0, 10.0)
                 shm.write_head_depth(head_depth_metric)
+
+                # Render D435i RGB + depth (640x480)
+                if d435i_camera_id >= 0:
+                    d435i_rgb_renderer.update_scene(
+                        data, camera=d435i_camera_id, scene_option=scene_option
+                    )
+                    shm.write_d435i_video(d435i_rgb_renderer.render())
+
+                    d435i_depth_renderer.update_scene(
+                        data, camera=d435i_camera_id, scene_option=scene_option
+                    )
+                    d435i_depth_metric = d435i_depth_renderer.render().astype(np.float32)
+                    d435i_depth_metric = np.clip(d435i_depth_metric, 0.0, 10.0)
+                    shm.write_d435i_depth(d435i_depth_metric)
 
                 last_video_time = current_time
 
@@ -237,7 +277,8 @@ def _run_simulation(config: GlobalConfig, shm: ShmReader) -> None:
             if time_until_next_step > 0:
                 time.sleep(time_until_next_step)
 
-        person_position_controller.stop()
+        if person_position_controller is not None:
+            person_position_controller.stop()
 
 
 if __name__ == "__main__":

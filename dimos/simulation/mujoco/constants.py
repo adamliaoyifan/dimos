@@ -20,6 +20,17 @@ VIDEO_HEIGHT = 240
 VIDEO_CAMERA_FOV = 45  # MuJoCo default FOV for head_camera (degrees)
 DEPTH_CAMERA_FOV = 160
 
+# Simulated Intel RealSense D435i camera constants
+D435I_WIDTH = 640
+D435I_HEIGHT = 480
+D435I_FOV = 42.7  # degrees, derived from fy=614, h=480
+
+# Simulated Intel RealSense D455i camera constants
+# FOV derived from default fy=382 at h=480: 2*atan(240/382) ≈ 57 deg vertical
+D455I_WIDTH = 640
+D455I_HEIGHT = 480
+D455I_FOV = 57.0  # degrees (wider FOV than D435i)
+
 # Depth camera range/filtering constants
 MAX_RANGE = 3
 MIN_RANGE = 0.2

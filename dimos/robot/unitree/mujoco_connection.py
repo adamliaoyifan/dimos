@@ -86,6 +86,8 @@ class MujocoConnection:
         self._last_odom_seq = 0
         self._last_lidar_seq = 0
         self._last_depth_seq = 0
+        self._last_d435i_video_seq = 0
+        self._last_d435i_depth_seq = 0
         self._stop_timer: threading.Timer | None = None
 
         self._stream_threads: list[threading.Thread] = []
@@ -229,6 +231,8 @@ class MujocoConnection:
         self.odom_stream.cache_clear()
         self.video_stream.cache_clear()
         self.depth_stream.cache_clear()
+        self.d435i_video_stream.cache_clear()
+        self.d435i_depth_stream.cache_clear()
 
     def standup(self) -> bool:
         return True
@@ -284,6 +288,26 @@ class MujocoConnection:
             self._last_depth_seq = seq
             return frame
 
+        return None
+
+    def get_d435i_video_frame(self) -> NDArray[Any] | None:
+        """Read the latest D435i RGB frame (uint8, 640x480)."""
+        if self.shm_data is None:
+            return None
+        frame, seq = self.shm_data.read_d435i_video()
+        if seq > self._last_d435i_video_seq:
+            self._last_d435i_video_seq = seq
+            return frame
+        return None
+
+    def get_d435i_depth_frame(self) -> NDArray[Any] | None:
+        """Read the latest D435i depth frame (float32, metres, 640x480)."""
+        if self.shm_data is None:
+            return None
+        frame, seq = self.shm_data.read_d435i_depth()
+        if seq > self._last_d435i_depth_seq:
+            self._last_d435i_depth_seq = seq
+            return frame
         return None
 
     def get_lidar_message(self) -> PointCloud2 | None:
@@ -359,6 +383,24 @@ class MujocoConnection:
             return Image.from_numpy(frame, format=ImageFormat.DEPTH) if frame is not None else None
 
         return self._create_stream(get_depth_as_image, VIDEO_FPS, "Depth")
+
+    @functools.cache
+    def d435i_video_stream(self) -> Observable[Image]:
+        """Stream of simulated D435i RGB images (640x480) as ``Image``."""
+        def get_d435i_as_image() -> Image | None:
+            frame = self.get_d435i_video_frame()
+            return Image.from_numpy(frame, format=ImageFormat.RGB) if frame is not None else None
+
+        return self._create_stream(get_d435i_as_image, VIDEO_FPS, "D435i_Video")
+
+    @functools.cache
+    def d435i_depth_stream(self) -> Observable[Image]:
+        """Stream of simulated D435i depth images (float32, metres, 640x480) as ``Image``."""
+        def get_d435i_depth_as_image() -> Image | None:
+            frame = self.get_d435i_depth_frame()
+            return Image.from_numpy(frame, format=ImageFormat.DEPTH) if frame is not None else None
+
+        return self._create_stream(get_d435i_depth_as_image, VIDEO_FPS, "D435i_Depth")
 
     def move(self, twist: Twist, duration: float = 0.0) -> bool:
         if self._is_cleaned_up or self.shm_data is None:
