@@ -46,8 +46,9 @@ from dimos.web.websocket_vis.websocket_vis_module import WebsocketVisModule
 
 def _convert_camera_info(camera_info: Any) -> Any:
     return camera_info.to_rerun(
-        image_topic="/world/color_image",
+        image_topic="/world/camera_optical/rgb",
         optical_frame="camera_optical",
+        camera_entity="/world/camera_optical",
     )
 
 
@@ -81,7 +82,7 @@ def _g1_rerun_blueprint() -> Any:
 
     return rrb.Blueprint(
         rrb.Horizontal(
-            rrb.Spatial2DView(origin="world/color_image", name="Camera"),
+            rrb.Spatial2DView(origin="world/camera_optical/rgb", name="Camera"),
             rrb.Spatial3DView(origin="world", name="3D"),
             column_shares=[1, 2],
         ),

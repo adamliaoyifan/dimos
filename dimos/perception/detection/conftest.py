@@ -101,7 +101,7 @@ def get_moment(tf):
         if odom_frame is None:
             raise ValueError("No odom frame found")
 
-        transforms = connection.GO2Connection._odom_to_tf(odom_frame)
+        transforms = connection._build_odom_tf(odom_frame)
 
         tf.receive_transform(*transforms)
 

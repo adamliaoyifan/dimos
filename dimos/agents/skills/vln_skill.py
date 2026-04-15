@@ -140,6 +140,12 @@ class VLNConfig(ModuleConfig):
     """If the costmap observed fraction exceeds this value the boundary is considered fully
     explored and the search terminates early."""
 
+    room_layout: str = ""
+    """Path to a room layout YAML file (e.g. configs/sim/room_layout_house.yaml).
+    When non-empty and the file exists, room centroids are seeded into SpatialMemory
+    at startup via tag_location so VLN can navigate to named rooms immediately
+    without requiring prior exploration.  Set to empty string to disable (default)."""
+
 
 class VLNSkillContainer(Module[VLNConfig]):
     """Vision-and-Language Navigation skill for compound goals.
@@ -273,10 +279,66 @@ class VLNSkillContainer(Module[VLNConfig]):
             self.config.exploration_mode, self.config.vlm_backend,
         )
 
+        if self.config.room_layout:
+            seed_thread = threading.Thread(
+                target=self._seed_rooms_delayed,
+                args=(self.config.room_layout,),
+                daemon=True,
+                name="vln_room_seed",
+            )
+            seed_thread.start()
+
     @rpc
     def stop(self) -> None:
         self._cancel_search()
         super().stop()
+
+    def _seed_rooms_delayed(self, path: str, delay: float = 5.0) -> None:
+        """Background thread: wait for SpatialMemory to come up, then seed rooms."""
+        time.sleep(delay)
+        self._seed_rooms_from_layout(path)
+
+    def _seed_rooms_from_layout(self, path: str) -> None:
+        """Seed SpatialMemory with room centroids from a room layout YAML file.
+
+        Reads rooms: {name: {x, y}} entries from the YAML and calls
+        SpatialMemory.tag_location for each one so query_tagged_location
+        can find rooms by name for immediate navigation without prior exploration.
+        """
+        import yaml
+
+        layout_path = Path(path)
+        if not layout_path.exists():
+            logger.warning("[VLN] room_layout file not found: %s", path)
+            return
+        with open(layout_path) as f:
+            layout = yaml.safe_load(f) or {}
+        rooms = layout.get("rooms", {})
+        if not rooms:
+            logger.info("[VLN] room_layout has no rooms section: %s", path)
+            return
+        try:
+            tag_rpc = self.get_rpc_calls("SpatialMemory.tag_location")
+        except Exception as exc:
+            logger.warning("[VLN] cannot seed rooms — SpatialMemory.tag_location unavailable: %s", exc)
+            return
+        from dimos.types.robot_location import RobotLocation
+
+        seeded = 0
+        for name, data in rooms.items():
+            try:
+                x = float(data.get("x", 0)) if isinstance(data, dict) else 0.0
+                y = float(data.get("y", 0)) if isinstance(data, dict) else 0.0
+                loc = RobotLocation(
+                    name=name,
+                    position=(x, y, 0.0),
+                    rotation=(0.0, 0.0, 0.0),
+                )
+                tag_rpc(loc)
+                seeded += 1
+            except Exception as exc:
+                logger.warning("[VLN] failed to seed room '%s': %s", name, exc)
+        logger.info("[VLN] seeded %d rooms from %s into SpatialMemory", seeded, path)
 
     def _on_image(self, image: Image) -> None:
         self._latest_image = image
@@ -578,37 +640,60 @@ class VLNSkillContainer(Module[VLNConfig]):
     # ------------------------------------------------------------------
 
     def _navigate_to_semantic(self, query: str) -> bool:
-        """Try to navigate to a location found in the semantic map."""
-        try:
-            query_rpc = self.get_rpc_calls("SpatialMemory.query_by_text")
-        except Exception:
-            return False
+        """Try to navigate to a location found in the semantic map.
 
-        results = query_rpc(query)
-        if not results:
-            return False
-
-        best = results[0]
-        similarity = 1.0 - (best.get("distance") or 1)
-        if similarity < self.config.similarity_threshold:
-            return False
-
-        metadata = best.get("metadata")
-        if not metadata:
-            return False
-        first = metadata[0]
-        pose = PoseStamped(
-            position=make_vector3(first.get("pos_x", 0), first.get("pos_y", 0), 0),
-            orientation=Quaternion.from_euler(make_vector3(0, 0, first.get("rot_z", 0))),
-            frame_id="map",
-        )
-
+        Attempt 1: CLIP image-based semantic memory (populated during exploration).
+        Attempt 2: Pre-seeded named locations via query_tagged_location (e.g. from
+          room_layout_house.yaml seeded at startup). This allows immediate navigation
+          to known rooms without requiring prior exploration.
+        """
         try:
             set_goal_rpc = self.get_rpc_calls("ReplanningAStarPlanner.set_goal")
         except Exception:
             return False
 
-        return set_goal_rpc(pose)
+        # Attempt 1: CLIP image-based semantic memory
+        try:
+            query_rpc = self.get_rpc_calls("SpatialMemory.query_by_text")
+            results = query_rpc(query)
+            if results:
+                best = results[0]
+                similarity = 1.0 - (best.get("distance") or 1)
+                if similarity >= self.config.similarity_threshold:
+                    metadata = best.get("metadata")
+                    if metadata:
+                        first = metadata[0]
+                        pose = PoseStamped(
+                            position=make_vector3(first.get("pos_x", 0), first.get("pos_y", 0), 0),
+                            orientation=Quaternion.from_euler(
+                                make_vector3(0, 0, first.get("rot_z", 0))
+                            ),
+                            frame_id="map",
+                        )
+                        if set_goal_rpc(pose):
+                            return True
+        except Exception:
+            pass
+
+        # Attempt 2: pre-seeded named locations (tag_location / room_layout seeding)
+        try:
+            tagged_rpc = self.get_rpc_calls("SpatialMemory.query_tagged_location")
+            location = tagged_rpc(query)
+            if location is not None:
+                pose = PoseStamped(
+                    position=make_vector3(
+                        float(location.position[0]), float(location.position[1]), 0
+                    ),
+                    orientation=Quaternion.from_euler(
+                        make_vector3(0, 0, float(location.rotation[2]))
+                    ),
+                    frame_id="map",
+                )
+                return set_goal_rpc(pose)
+        except Exception:
+            pass
+
+        return False
 
     def _wait_for_navigation(self, timeout: float = 30.0) -> bool:
         """Block until navigation finishes or timeout. Returns True if goal reached."""

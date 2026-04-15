@@ -317,11 +317,20 @@ class CameraInfo(Timestamped):
         # module doesn't implement this correctly
         image_topic: str | None = None,
         optical_frame: str | None = None,
+        camera_entity: str | None = None,
     ) -> RerunData:
         """Convert to Rerun Pinhole archetype for camera frustum visualization.
 
         Args:
             image_plane_distance: Distance to draw the image plane in the frustum
+            image_topic: Entity path where the image (and Pinhole) will be logged.
+                Must be a child of camera_entity when camera_entity is provided.
+            optical_frame: TF frame name for the optical axis (e.g. "camera_optical").
+            camera_entity: Separate anchor entity path that receives only the
+                Transform3D connecting the camera to its TF frame.  When provided,
+                the Transform3D is emitted here and the Pinhole is emitted at
+                image_topic, avoiding the Rerun "frame has two parents" conflict
+                that occurs when both are logged at the same entity.
 
         Returns:
             rr.Pinhole archetype for logging to Rerun
@@ -348,10 +357,6 @@ class CameraInfo(Timestamped):
 
         ret: RerunMulti = []
 
-        # Add pinhole under world/image_topic (we know which Image this CameraInfo refers to)
-        # Note: parent_frame is supposed to work according to:
-        # https://rerun.io/docs/reference/types/archetypes/pinhole
-        # But it doesn't, so we add the transform separately below
         ret.append(
             (
                 image_topic,
@@ -368,10 +373,14 @@ class CameraInfo(Timestamped):
         if not optical_frame:
             return ret
 
-        # Add 3d transform from optical frame to world/image_topic (We know where the camera is)
+        # Emit the Transform3D at a dedicated anchor entity (camera_entity) so it
+        # has a different entity path from the Pinhole.  Rerun only allows a single
+        # TF parent per frame; logging both Pinhole and Transform3D at the same
+        # entity would give the frame two parents and trigger a warning.
+        transform_entity = camera_entity if camera_entity else image_topic
         ret.append(
             (
-                image_topic,
+                transform_entity,
                 rr.Transform3D(parent_frame=f"tf#/{optical_frame}"),
             )
         )

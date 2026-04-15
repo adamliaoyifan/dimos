@@ -46,7 +46,7 @@ class Go2Moment(Moment):
         # back and forth through time and foxglove doesn't get confused
         odom = self.odom.value
         odom.ts = time.time()
-        return connection.GO2Connection._odom_to_tf(odom)
+        return connection._build_odom_tf(odom)
 
     def publish(self) -> None:
         t = TF()

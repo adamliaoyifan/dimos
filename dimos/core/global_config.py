@@ -56,6 +56,20 @@ class GlobalConfig(BaseSettings):
     dtop: bool = False
     obstacle_avoidance: bool = True
     detection_model: VlModelName = "moondream"
+    # RealSense camera name used in MuJoCo simulation (looked up via mj_name2id).
+    # Set to "d455i_rgbd" when using trajectory_camera: d455i_sim; defaults to "d435i_rgb".
+    realsense_camera_name: str = "d435i_rgb"
+    # RealSense extrinsics in base_link frame (metres / radians).
+    # Set by the active vln_config.yaml camera profile via .global_config() on the blueprint.
+    realsense_x: float = 0.15
+    realsense_y: float = 0.00
+    realsense_z: float = 0.28
+    realsense_pitch: float = 0.10
+    # RealSense intrinsics: flat 9-element row-major K matrix [fx,0,cx,0,fy,cy,0,0,1].
+    # When set, GO2Connection publishes a CameraInfo on the realsense_camera_info stream.
+    realsense_intrinsic: list[float] | None = None
+    realsense_width: int = 640
+    realsense_height: int = 480
 
     model_config = SettingsConfigDict(
         env_file=".env",

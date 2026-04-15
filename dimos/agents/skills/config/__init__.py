@@ -226,6 +226,10 @@ class DeploymentConfig:
         "appearance. Be aware that the wide-angle lens may cause slight barrel "
         "distortion near image edges.\n\n"
     )
+    room_layout: str = ""
+    """Path to room layout YAML for SpatialMemory seeding at startup.
+    E.g. "configs/sim/room_layout_house.yaml" for the multi-room house scene.
+    Set to empty string to disable (default — no pre-seeding)."""
 
 
 @dataclass

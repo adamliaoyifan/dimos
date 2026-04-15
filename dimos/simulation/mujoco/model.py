@@ -56,11 +56,11 @@ def get_assets() -> dict[str, bytes]:
 
 
 def load_model(
-    input_device: InputController, robot: str, scene_xml: str
+    input_device: InputController, robot: str, scene_xml: str, scene_name: str = "office1"
 ) -> tuple[mujoco.MjModel, mujoco.MjData]:
     mujoco.set_mjcb_control(None)
 
-    xml_string = get_model_xml(robot, scene_xml)
+    xml_string = get_model_xml(robot, scene_xml, scene_name=scene_name)
     model = mujoco.MjModel.from_xml_string(xml_string, assets=get_assets())
     data = mujoco.MjData(model)
 
@@ -98,7 +98,7 @@ def load_model(
     return model, data
 
 
-def get_model_xml(robot: str, scene_xml: str) -> str:
+def get_model_xml(robot: str, scene_xml: str, scene_name: str = "office1") -> str:
     root = ET.fromstring(scene_xml)
     root.set("model", f"{robot}_scene")
     root.insert(0, ET.Element("include", file=f"{robot}.xml"))
@@ -113,7 +113,8 @@ def get_model_xml(robot: str, scene_xml: str) -> str:
     map_elem.set("znear", "0.01")
     map_elem.set("zfar", "10000")
 
-    _add_person_object(root)
+    if scene_name == "office1":
+        _add_person_object(root)
 
     return ET.tostring(root, encoding="unicode")
 
