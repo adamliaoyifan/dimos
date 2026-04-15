@@ -64,7 +64,7 @@ navdp:
   # Use "go2" in simulation.
   # "realsense_d435" — in-process ROS2 bridge (requires rclpy in DimOS Python).
   # "realsense_lcm" — run ros2_dimos_lcm_bridge under ROS 2, then DimOS (e.g. Python 3.14).
-  trajectory_camera: realsense_lcm
+  trajectory_camera: d435i_sim
 
   # Camera profiles — add or override entries here.
   # Each entry becomes a CameraConfig that can be selected via trajectory_camera.
@@ -102,6 +102,63 @@ navdp:
       ros2_rgb_topic: /camera/camera/color/image_raw/compressed
       ros2_depth_topic: /camera/camera/aligned_depth_to_color/image_raw/compressed
       ros2_depth_scale: 1000.0   # uint16 mm → float32 metres
+
+    # Simulated D435i in MuJoCo — same extrinsics/intrinsics as the real
+    # RealSense profiles.  Images are rendered by MuJoCo and published on
+    # the ``realsense_image`` / ``realsense_depth`` pSHM channels, so
+    # downstream consumers (NavDP, VLN web) work without any extra wiring.
+    # Select with:  trajectory_camera: d435i_sim
+    d435i_sim:
+      intrinsic:
+        - [614.0, 0.0, 320.0]
+        - [0.0, 614.0, 240.0]
+        - [0.0, 0.0, 1.0]
+      x: 0.15
+      y: 0.00
+      z: 0.28
+      pitch: 0.10
+      width: 640
+      height: 480
+      fps: 30
+
+    # Intel RealSense D455i mounted on Go2.
+    # Replace intrinsic values with your actual D455i calibration
+    # (run: rs-enumerate-devices -c, or use factory defaults below).
+    # D455i default at 640x480: fx=fy~382, FOV ~87 deg horizontal.
+    # Extrinsics: adjust x/y/z/pitch to match your physical mount.
+    d455i:
+      intrinsic:
+        - [382.0, 0.0, 320.0]   # [fx,  0, cx]
+        - [0.0,  382.0, 240.0]  # [ 0, fy, cy]
+        - [0.0,   0.0,   1.0]
+      x: 0.15        # forward offset from base_link (m)
+      y: 0.00        # lateral offset — positive = left (m)
+      z: 0.30        # height above ground (m)
+      pitch: 0.10    # downward tilt in radians (~5.7 deg)
+      width: 640
+      height: 480
+      fps: 30
+      # Set these when using ROS2 bridge (trajectory_camera: d455i):
+      ros2_rgb_topic: /camera/camera/color/image_raw/compressed
+      ros2_depth_topic: /camera/camera/aligned_depth_to_color/image_raw/compressed
+      ros2_depth_scale: 1000.0
+
+    # Simulated D455i in MuJoCo — same intrinsics/extrinsics as the real d455i profile.
+    # Images are rendered by the d455i_rgbd MuJoCo camera and published on the
+    # realsense_image / realsense_depth pSHM channels.
+    # Select with:  trajectory_camera: d455i_sim
+    d455i_sim:
+      intrinsic:
+        - [382.0, 0.0, 320.0]
+        - [0.0,  382.0, 240.0]
+        - [0.0,   0.0,   1.0]
+      x: 0.15
+      y: 0.00
+      z: 0.30
+      pitch: 0.10
+      width: 640
+      height: 480
+      fps: 30
 
     # Same RealSense geometry as realsense_d435; images arrive via LCM from
     # ``ros2_dimos_lcm_bridge`` (see ros2_dimos_lcm_bridge/README.md).
@@ -184,7 +241,11 @@ blueprint:
 # vlm_prompt_prefix is prepended to EVERY VLM query in simulation mode.
 # hardware_vlm_prompt_prefix is used instead when simulation is disabled.
 deployment:
-  enabled: false  # ← change to false for real hardware
+  enabled: false  # ← change to true for MuJoCo simulation
+  # Path to room layout YAML for SpatialMemory seeding at startup.
+  # Set to "configs/sim/room_layout_house.yaml" when using --mujoco-room house.
+  # Leave empty ("") for the default office1 scene (no pre-seeded rooms).
+  room_layout: ""
   vlm_prompt_prefix: >-
     IMPORTANT: This image is from a 3D simulation, NOT a real camera.
     The scene uses simple 3D-rendered graphics with flat shading, basic

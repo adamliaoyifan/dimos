@@ -35,10 +35,13 @@ from rerun._baseclasses import Archetype
 from rerun.blueprint import Blueprint
 from toolz import pipe  # type: ignore[import-untyped]
 import typer
+import cv2
+import numpy as np
 
 from dimos.core.core import rpc
 from dimos.core.module import Module, ModuleConfig
-from dimos.msgs.sensor_msgs.Image import Image
+from dimos.core.stream import In
+from dimos.msgs.sensor_msgs.Image import Image, ImageFormat
 from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
 from dimos.protocol.pubsub.impl.lcmpubsub import LCM
 from dimos.protocol.pubsub.patterns import Glob, pattern_matches
@@ -54,7 +57,7 @@ _HEAVY_MSG_TYPES: tuple[type, ...] = (Image, PointCloud2)
 
 RERUN_GRPC_PORT = 9876
 RERUN_WEB_PORT = 9090
-
+_DEPTH_CLIP_MAX_M = 6.0
 # TODO OUT visual annotations
 #
 # In the future it would be nice if modules can annotate their individual OUTs with (general or rerun specific)
@@ -189,6 +192,9 @@ class RerunBridgeModule(Module[Config]):
     Spawns its own Rerun viewer and subscribes to all topics on each provided
     pubsub. Any message that has a to_rerun() method is automatically logged.
 
+    Optional ``realsense_image`` / ``realsense_depth`` In streams allow
+    pSHM-transported D435i images (which bypass LCM) to appear in the viewer.
+
     Example:
         from dimos.protocol.pubsub.impl.lcmpubsub import LCM
 
@@ -200,6 +206,13 @@ class RerunBridgeModule(Module[Config]):
     """
 
     default_config = Config
+
+    # Camera image streams.  pSHM transports are assigned by the blueprint so images
+    # arrive here directly without going through LCM (which is unreliable for large frames).
+    color_image: In[Image]
+    depth_image: In[Image]
+    realsense_image: In[Image]
+    realsense_depth: In[Image]
 
     @lru_cache(maxsize=256)
     def _visual_override_for_entity_path(
@@ -244,6 +257,78 @@ class RerunBridgeModule(Module[Config]):
         # Strip everything after # (LCM topic suffix)
         topic_str = topic_str.split("#")[0]
         return f"{self.config.entity_prefix}{topic_str}"
+
+    def _on_color_image(self, image: Image) -> None:
+        if not hasattr(image, "data") or image.data is None:
+            return
+
+        now = time.monotonic()
+        if now - self._last_log.get("world/camera_optical/rgb", 0.0) < self.config.min_interval_sec:
+            return
+        self._last_log["world/camera_optical/rgb"] = now
+
+        import rerun as rr
+
+        rr.log("world/camera_optical/rgb", rr.Image(image.data, color_model="RGB"))
+
+    def _on_depth_image(self, image: Image) -> None:
+        if not hasattr(image, "data") or image.data is None:
+            return
+
+        now = time.monotonic()
+        if now - self._last_log.get("world/camera_optical/depth", 0.0) < self.config.min_interval_sec:
+            return
+        self._last_log["world/camera_optical/depth"] = now
+
+        import rerun as rr
+
+        d = np.asarray(image.data)
+        if d.ndim == 3:
+            d = d[..., 0] if d.shape[-1] == 1 else cv2.cvtColor(d, cv2.COLOR_BGR2GRAY)
+        d_m = np.clip(d.astype(np.float32), 0.0, _DEPTH_CLIP_MAX_M)
+        rr.log("world/camera_optical/depth", rr.DepthImage(d_m, meter=1.0))
+
+    def _on_realsense_image(self, image: Image) -> None:
+        if not hasattr(image, "data") or image.data is None:
+            return
+
+        now = time.monotonic()
+        if now - self._last_log.get("world/realsense_optical/rgb", 0.0) < self.config.min_interval_sec:
+            return
+        self._last_log["world/realsense_optical/rgb"] = now
+
+        import rerun as rr
+
+        self._latest_realsense_frame = cv2.cvtColor(image.data, cv2.COLOR_RGB2BGR)
+        rr.log("world/realsense_optical/rgb", rr.Image(image.data, color_model="RGB"))
+
+    def _on_realsense_depth(self, image: Image) -> None:
+        if not hasattr(image, "data") or image.data is None:
+            return
+
+        now = time.monotonic()
+        if now - self._last_log.get("world/realsense_optical/depth", 0.0) < self.config.min_interval_sec:
+            return
+        self._last_log["world/realsense_optical/depth"] = now
+
+        import rerun as rr
+
+        d = np.asarray(image.data)
+        if d.ndim == 3:
+            d = d[..., 0] if d.shape[-1] == 1 else cv2.cvtColor(d, cv2.COLOR_BGR2GRAY)
+
+        if image.format == ImageFormat.DEPTH16 or d.dtype == np.uint16:
+            d_m = d.astype(np.float32) / 1000.0
+        else:
+            d_m = d.astype(np.float32)
+
+        d_m = np.clip(d_m, 0.0, _DEPTH_CLIP_MAX_M)
+
+        # Stash colorized depth for WebSocket visualization
+        norm = (d_m / _DEPTH_CLIP_MAX_M * 255.0).astype(np.uint8)
+        self._latest_depth_frame = cv2.applyColorMap(norm, cv2.COLORMAP_TURBO)
+
+        rr.log("world/realsense_optical/depth", rr.DepthImage(d_m, meter=1.0))
 
     def _on_message(self, msg: Any, topic: Any) -> None:
         """Handle incoming message - log to rerun."""
@@ -323,6 +408,11 @@ class RerunBridgeModule(Module[Config]):
                 pubsub.start()  # type: ignore[union-attr]
             unsub = pubsub.subscribe_all(self._on_message)
             self._disposables.add(Disposable(unsub))
+
+        self._disposables.add(Disposable(self.color_image.subscribe(self._on_color_image)))
+        self._disposables.add(Disposable(self.depth_image.subscribe(self._on_depth_image)))
+        self._disposables.add(Disposable(self.realsense_image.subscribe(self._on_realsense_image)))
+        self._disposables.add(Disposable(self.realsense_depth.subscribe(self._on_realsense_depth)))
 
         # Add pubsub stop as disposable
         for pubsub in self.config.pubsubs:

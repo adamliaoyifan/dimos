@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import math
 import sys
 from threading import Thread
 import time
@@ -55,8 +56,83 @@ else:
 logger = logging.getLogger(__name__)
 
 
+def _pitch_to_quaternion(pitch: float) -> Quaternion:
+    """Convert a pitch angle (radians, positive = tilt downward) to a quaternion.
+
+    Rotation around the Y-axis: qx=0, qy=sin(pitch/2), qz=0, qw=cos(pitch/2).
+    """
+    half = pitch / 2.0
+    return Quaternion(0.0, math.sin(half), 0.0, math.cos(half))
+
+
+def _build_odom_tf(
+    odom: "PoseStamped",
+    rs_x: float = 0.15,
+    rs_y: float = 0.0,
+    rs_z: float = 0.28,
+    rs_pitch: float = 0.10,
+) -> "list[Transform]":
+    """Build the full TF transform list from an odometry message.
+
+    Parameters are the RealSense camera extrinsics in the base_link frame.
+    Used by GO2Connection._odom_to_tf (instance method) and standalone utilities.
+    """
+    camera_link = Transform(
+        translation=Vector3(0.3, 0.0, 0.0),
+        rotation=Quaternion(0.0, 0.0, 0.0, 1.0),
+        frame_id="base_link",
+        child_frame_id="camera_link",
+        ts=odom.ts,
+    )
+
+    camera_optical = Transform(
+        translation=Vector3(0.0, 0.0, 0.0),
+        rotation=Quaternion(-0.5, 0.5, -0.5, 0.5),
+        frame_id="camera_link",
+        child_frame_id="camera_optical",
+        ts=odom.ts,
+    )
+
+    rs_link = Transform(
+        translation=Vector3(rs_x, rs_y, rs_z),
+        rotation=_pitch_to_quaternion(rs_pitch),
+        frame_id="base_link",
+        child_frame_id="realsense_link",
+        ts=odom.ts,
+    )
+
+    rs_optical = Transform(
+        translation=Vector3(0.0, 0.0, 0.0),
+        rotation=Quaternion(-0.5, 0.5, -0.5, 0.5),
+        frame_id="realsense_link",
+        child_frame_id="realsense_optical",
+        ts=odom.ts,
+    )
+
+    return [
+        Transform.from_pose("base_link", odom),
+        camera_link,
+        camera_optical,
+        rs_link,
+        rs_optical,
+    ]
+
+
 class ConnectionConfig(ModuleConfig):
     ip: str = Field(default_factory=lambda m: m["g"].robot_ip)
+    # RealSense extrinsics (base_link frame, metres / radians).
+    # Populated from GlobalConfig which is set by the active vln_config.yaml camera profile.
+    realsense_x: float = Field(default_factory=lambda m: m["g"].realsense_x)
+    realsense_y: float = Field(default_factory=lambda m: m["g"].realsense_y)
+    realsense_z: float = Field(default_factory=lambda m: m["g"].realsense_z)
+    realsense_pitch: float = Field(default_factory=lambda m: m["g"].realsense_pitch)
+    # RealSense intrinsics: flat 9-element row-major K matrix [fx,0,cx,0,fy,cy,0,0,1].
+    # When set, a CameraInfo is published on the realsense_camera_info stream.
+    realsense_intrinsic: list[float] | None = Field(
+        default_factory=lambda m: m["g"].realsense_intrinsic
+    )
+    realsense_width: int = Field(default_factory=lambda m: m["g"].realsense_width)
+    realsense_height: int = Field(default_factory=lambda m: m["g"].realsense_height)
 
 
 class Go2ConnectionProtocol(Protocol):
@@ -192,12 +268,16 @@ class GO2Connection(Module[_Config], Camera, Pointcloud):
     lidar: Out[PointCloud2]
     color_image: Out[Image]
     depth_image: Out[Image]
+    realsense_image: Out[Image]
+    realsense_depth: Out[Image]
     camera_info: Out[CameraInfo]
+    realsense_camera_info: Out[CameraInfo]
 
     connection: Go2ConnectionProtocol
     camera_info_static: CameraInfo = _camera_info_static()
     _camera_info_thread: Thread | None = None
     _latest_video_frame: Image | None = None
+    _realsense_camera_info_static: CameraInfo | None = None
 
     @classmethod
     def rerun_views(cls):  # type: ignore[no-untyped-def]
@@ -215,6 +295,32 @@ class GO2Connection(Module[_Config], Camera, Pointcloud):
 
         if hasattr(self.connection, "camera_info_static"):
             self.camera_info_static = self.connection.camera_info_static
+
+        self._realsense_camera_info_static = self._make_realsense_camera_info()
+
+    def _make_realsense_camera_info(self) -> CameraInfo | None:
+        """Build a CameraInfo for the RealSense camera from ConnectionConfig intrinsics.
+
+        Returns None when no intrinsics are configured (realsense_intrinsic is None).
+        """
+        k = self.config.realsense_intrinsic
+        if not k or len(k) != 9:
+            return None
+
+        fx, cx = k[0], k[2]
+        fy, cy = k[4], k[5]
+        w, h = self.config.realsense_width, self.config.realsense_height
+
+        return CameraInfo(
+            frame_id="realsense_optical",
+            height=h,
+            width=w,
+            distortion_model="plumb_bob",
+            D=[0.0, 0.0, 0.0, 0.0, 0.0],
+            K=list(k),
+            R=[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            P=[fx, 0.0, cx, 0.0, 0.0, fy, cy, 0.0, 0.0, 0.0, 1.0, 0.0],
+        )
 
     @rpc
     def record(self, recording_name: str) -> None:
@@ -249,6 +355,17 @@ class GO2Connection(Module[_Config], Camera, Pointcloud):
                 self.connection.depth_stream().subscribe(self.depth_image.publish)
             )
 
+        # Simulated D435i streams (MuJoCo only) — published as realsense_image/depth
+        # so they appear on the same pSHM channels the real RealSense relay uses.
+        if hasattr(self.connection, "d435i_video_stream"):
+            self._disposables.add(
+                self.connection.d435i_video_stream().subscribe(self.realsense_image.publish)
+            )
+        if hasattr(self.connection, "d435i_depth_stream"):
+            self._disposables.add(
+                self.connection.d435i_depth_stream().subscribe(self.realsense_depth.publish)
+            )
+
         self._camera_info_thread = Thread(
             target=self.publish_camera_info,
             daemon=True,
@@ -274,29 +391,15 @@ class GO2Connection(Module[_Config], Camera, Pointcloud):
 
         super().stop()
 
-    @classmethod
-    def _odom_to_tf(cls, odom: PoseStamped) -> list[Transform]:
-        camera_link = Transform(
-            translation=Vector3(0.3, 0.0, 0.0),
-            rotation=Quaternion(0.0, 0.0, 0.0, 1.0),
-            frame_id="base_link",
-            child_frame_id="camera_link",
-            ts=odom.ts,
+    def _odom_to_tf(self, odom: PoseStamped) -> list[Transform]:
+        # RealSense extrinsics come from ConnectionConfig (set by vln_config.yaml via GlobalConfig).
+        return _build_odom_tf(
+            odom,
+            rs_x=self.config.realsense_x,
+            rs_y=self.config.realsense_y,
+            rs_z=self.config.realsense_z,
+            rs_pitch=self.config.realsense_pitch,
         )
-
-        camera_optical = Transform(
-            translation=Vector3(0.0, 0.0, 0.0),
-            rotation=Quaternion(-0.5, 0.5, -0.5, 0.5),
-            frame_id="camera_link",
-            child_frame_id="camera_optical",
-            ts=odom.ts,
-        )
-
-        return [
-            Transform.from_pose("base_link", odom),
-            camera_link,
-            camera_optical,
-        ]
 
     def _publish_tf(self, msg: PoseStamped) -> None:
         transforms = self._odom_to_tf(msg)
@@ -307,6 +410,11 @@ class GO2Connection(Module[_Config], Camera, Pointcloud):
     def publish_camera_info(self) -> None:
         while True:
             self.camera_info.publish(self.camera_info_static)
+            if (
+                self._realsense_camera_info_static is not None
+                and self.realsense_camera_info.transport
+            ):
+                self.realsense_camera_info.publish(self._realsense_camera_info_static)
             time.sleep(1.0)
 
     @rpc

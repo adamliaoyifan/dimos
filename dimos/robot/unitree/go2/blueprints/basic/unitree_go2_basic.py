@@ -20,32 +20,86 @@ from typing import Any
 from dimos.constants import DEFAULT_CAPACITY_COLOR_IMAGE
 from dimos.core.blueprints import autoconnect
 from dimos.core.global_config import global_config
-from dimos.core.transport import pSHMTransport
+from dimos.core.transport import LCMTransport, pSHMTransport
+from dimos.msgs.sensor_msgs.CameraInfo import CameraInfo
 from dimos.msgs.sensor_msgs.Image import Image
 from dimos.protocol.pubsub.impl.lcmpubsub import LCM
 from dimos.protocol.service.system_configurator.clock_sync import ClockSyncConfigurator
 from dimos.robot.unitree.go2.connection import GO2Connection
 from dimos.web.websocket_vis.websocket_vis_module import WebsocketVisModule
 
-# Mac has some issue with high bandwidth UDP, so we use pSHMTransport for color_image
-# actually we can use pSHMTransport for all platforms, and for all streams
-# TODO need a global transport toggle on blueprints/global config
-_mac_transports: dict[tuple[str, type], pSHMTransport[Image]] = {
+# Use pSHM for all image streams on all platforms.
+# LCM UDP multicast is unreliable for large payloads (640x480 ~900KB, 320x240 ~230KB)
+# and pSHM gives zero-copy delivery to all in-process consumers (Rerun bridge, NavDP, etc.).
+_image_transports: dict[tuple[str, type], Any] = {
+    # Go2 head camera (320x240)
     ("color_image", Image): pSHMTransport(
         "color_image", default_capacity=DEFAULT_CAPACITY_COLOR_IMAGE
     ),
+    ("depth_image", Image): pSHMTransport(
+        "depth_image", default_capacity=DEFAULT_CAPACITY_COLOR_IMAGE
+    ),
+    # RealSense / D455i camera (640x480)
+    ("realsense_image", Image): pSHMTransport(
+        "realsense_image", default_capacity=DEFAULT_CAPACITY_COLOR_IMAGE
+    ),
+    ("realsense_depth", Image): pSHMTransport(
+        "realsense_depth", default_capacity=DEFAULT_CAPACITY_COLOR_IMAGE
+    ),
+    ("realsense_camera_info", CameraInfo): LCMTransport("/realsense_camera_info", CameraInfo),
 }
 
-_transports_base = (
-    autoconnect() if platform.system() == "Linux" else autoconnect().transports(_mac_transports)
-)
+_transports_base = autoconnect().transports(_image_transports)
 
 
 def _convert_camera_info(camera_info: Any) -> Any:
-    return camera_info.to_rerun(
-        image_topic="/world/color_image",
+    # Pinhole goes to child entities; Transform3D goes to the anchor entity.
+    # This avoids the Rerun "frame has two parents" conflict.
+    rgb = camera_info.to_rerun(
+        image_topic="/world/camera_optical/rgb",
         optical_frame="camera_optical",
+        camera_entity="/world/camera_optical",
     )
+    depth = camera_info.to_rerun(
+        image_topic="/world/camera_optical/depth",
+        optical_frame="camera_optical",
+        camera_entity="/world/camera_optical",
+    )
+    rgb_list: list[Any] = rgb if isinstance(rgb, list) else []
+    depth_list: list[Any] = depth if isinstance(depth, list) else []
+    # De-duplicate the Transform3D anchor entry (both calls emit the same one)
+    seen: set[tuple[Any, Any]] = set()
+    result: list[Any] = []
+    for item in rgb_list + depth_list:
+        key = (item[0], type(item[1]).__name__)
+        if key not in seen:
+            seen.add(key)
+            result.append(item)
+    return result
+
+
+def _convert_realsense_camera_info(camera_info: Any) -> Any:
+    # Same split pattern for RealSense / D455i.
+    rgb = camera_info.to_rerun(
+        image_topic="/world/realsense_optical/rgb",
+        optical_frame="realsense_optical",
+        camera_entity="/world/realsense_optical",
+    )
+    depth = camera_info.to_rerun(
+        image_topic="/world/realsense_optical/depth",
+        optical_frame="realsense_optical",
+        camera_entity="/world/realsense_optical",
+    )
+    rgb_list: list[Any] = rgb if isinstance(rgb, list) else []
+    depth_list: list[Any] = depth if isinstance(depth, list) else []
+    seen2: set[tuple[Any, Any]] = set()
+    result2: list[Any] = []
+    for item in rgb_list + depth_list:
+        key = (item[0], type(item[1]).__name__)
+        if key not in seen2:
+            seen2.add(key)
+            result2.append(item)
+    return result2
 
 
 def _convert_global_map(grid: Any) -> Any:
@@ -73,14 +127,21 @@ def _static_base_link(rr: Any) -> list[Any]:
 
 
 def _go2_rerun_blueprint() -> Any:
-    """Split layout: camera feed + 3D world view side by side."""
+    """Split layout: camera feeds (Go2 + RealSense RGB/Depth) + 3D world view."""
     import rerun.blueprint as rrb
 
     return rrb.Blueprint(
         rrb.Horizontal(
-            rrb.Spatial2DView(origin="world/color_image", name="Camera"),
+            rrb.Vertical(
+                rrb.Spatial2DView(origin="world/camera_optical/rgb", name="Go2 Camera"),
+                rrb.Spatial2DView(origin="world/camera_optical/depth", name="Go2 Depth"),
+            ),
+            rrb.Vertical(
+                rrb.Spatial2DView(origin="world/realsense_optical/rgb", name="RealSense RGB"),
+                rrb.Spatial2DView(origin="world/realsense_optical/depth", name="RealSense Depth"),
+            ),
             rrb.Spatial3DView(origin="world", name="3D"),
-            column_shares=[1, 2],
+            column_shares=[1, 1, 2],
         ),
     )
 
@@ -97,6 +158,7 @@ rerun_config = {
     # This is unsustainable once we move to multi robot etc
     "visual_override": {
         "world/camera_info": _convert_camera_info,
+        "world/realsense_camera_info": _convert_realsense_camera_info,
         "world/global_map": _convert_global_map,
         "world/navigation_costmap": _convert_navigation_costmap,
     },

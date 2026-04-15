@@ -34,15 +34,40 @@ Usage:
     #   realsense_lcm — run ros2_dimos_lcm_bridge under ROS 2, then DimOS (e.g. Py 3.14).
     dimos run unitree-go2-vln-local --robot-ip 192.168.123.161
 
+    # Real hardware with D455i:
+    #   Set trajectory_camera: d455i in vln_config.yaml (uses ros2_compressed_bridge).
+    #   Or use realsense_lcm profile for external ros2_dimos_lcm_bridge.
+    dimos run unitree-go2-vln-local --robot-ip 192.168.123.161
+
+    # MuJoCo simulation with D455i (wider-FOV camera, 57-deg fovy):
+    dimos --simulation run unitree-go2-vln-local
+
     # With custom config:
     VLN_CONFIG=/path/to/my_config.yaml dimos run unitree-go2-vln-local --robot-ip 192.168.123.161
 
 Hardware checklist (edit vln_config.yaml before running on real robot):
     simulation.enabled: false   ← disables 3D-render VLM prompt prefix
-    navdp.trajectory_camera: go2 | realsense_d435 | realsense_lcm
+    navdp.trajectory_camera: go2 | realsense_d435 | realsense_lcm | d455i | d455i_sim
     vlm.base_url: http://<server>:8000
     agent.ollama_base_url: http://<server>:11434
     navdp.navdp_server_url: http://<server>:8880
+
+D455i real-hardware wiring:
+    Option A — in-process ROS2 bridge (needs rclpy in DimOS Python env):
+        Set trajectory_camera: d455i in vln_config.yaml.
+        The d455i profile's ros2_rgb_topic / ros2_depth_topic values point to the
+        standard RealSense ROS2 topics (/camera/camera/color/image_raw/compressed etc).
+        Replace the intrinsic with your actual D455i calibration values from:
+            rs-enumerate-devices -c  (or your calibration file).
+
+    Option B — external ros2_dimos_lcm_bridge (any Python version):
+        Set trajectory_camera: realsense_lcm in vln_config.yaml.
+        Run the bridge under ROS2:  ros2 run ros2_dimos_lcm_bridge bridge
+        Uses the realsense_lcm profile's lcm_rgb_basename / lcm_depth_basename channels.
+
+    If two RealSense devices are connected, select the D455i by serial number via
+    the RealSenseCamera module (in a custom blueprint):
+        RealSenseCamera.blueprint(serial_number="<D455i serial>", camera_name="d455i")
 """
 
 # ── IMPORTANT: set OLLAMA_HOST before any ollama imports ─────────────
@@ -157,7 +182,9 @@ _sim_prefix = (
 # NavDP trajectory camera (VLN web RealSense feeds when using RealSense pSHM paths)
 _is_realsense_ros = cfg.navdp.trajectory_camera == "realsense_d435"
 _is_realsense_lcm = cfg.navdp.trajectory_camera == "realsense_lcm"
-_uses_realsense_shm = _is_realsense_ros or _is_realsense_lcm
+_is_d435i_sim = cfg.navdp.trajectory_camera == "d435i_sim"
+_is_d455i_sim = cfg.navdp.trajectory_camera == "d455i_sim"
+_uses_realsense_shm = _is_realsense_ros or _is_realsense_lcm or _is_d435i_sim or _is_d455i_sim
 _vln_web_blueprint = VLNWebInput.blueprint(port=5556)
 if _uses_realsense_shm:
     _vln_web_blueprint = _vln_web_blueprint.transports(
@@ -394,6 +421,8 @@ _all_components = [
         cam_y=_traj_cam.y,
         cam_z=_traj_cam.z,
         cam_pitch=_traj_cam.pitch,
+        # Room layout YAML for SpatialMemory seeding (empty = disabled)
+        room_layout=cfg.deployment.room_layout,
     ).transports(
         {
             ("depth_image", Image): pSHMTransport("depth_image"),
@@ -408,12 +437,30 @@ _all_components = [
 
 _all_components.extend(_navdp_blueprints)
 
+# Flatten the 3×3 intrinsic matrix to a 9-element row-major list for GlobalConfig.
+_rs_intrinsic_flat: list[float] | None = (
+    [v for row in _traj_cam.intrinsic for v in row] if _traj_cam.intrinsic else None
+)
+
+# MuJoCo camera name: use d455i_rgbd for d455i_sim, d435i_rgb for d435i_sim/default.
+_mujoco_realsense_cam = "d455i_rgbd" if _is_d455i_sim else "d435i_rgb"
+
 unitree_go2_vln_local = (
     autoconnect(
         *_all_components,
     )
     .global_config(
         n_workers=cfg.blueprint.n_workers,
+        # Propagate the active camera's extrinsics/intrinsics to GO2Connection via GlobalConfig
+        # so TF frames and CameraInfo are published with the correct values.
+        realsense_camera_name=_mujoco_realsense_cam,
+        realsense_x=_traj_cam.x,
+        realsense_y=_traj_cam.y,
+        realsense_z=_traj_cam.z,
+        realsense_pitch=_traj_cam.pitch,
+        realsense_intrinsic=_rs_intrinsic_flat,
+        realsense_width=_traj_cam.width,
+        realsense_height=_traj_cam.height,
     )
     .requirements(
         ollama_installed,

@@ -104,6 +104,8 @@ class WebsocketVisModule(Module[WebsocketConfig]):
     global_costmap: In[OccupancyGrid]
     color_image: In[Image]
     depth_image: In[Image]
+    realsense_image: In[Image]
+    realsense_depth: In[Image]
 
     # LCM outputs
     goal_request: Out[PoseStamped]
@@ -135,6 +137,8 @@ class WebsocketVisModule(Module[WebsocketConfig]):
         # Image broadcasting rate limiting (5 Hz max)
         self._last_color_emit: float = 0.0
         self._last_depth_emit: float = 0.0
+        self._last_rs_color_emit: float = 0.0
+        self._last_rs_depth_emit: float = 0.0
         self._image_emit_interval: float = 0.2
 
         # Track GPS goal points for visualization
@@ -221,6 +225,18 @@ class WebsocketVisModule(Module[WebsocketConfig]):
 
         try:
             unsub = self.depth_image.subscribe(self._on_depth_image)
+            self._disposables.add(Disposable(unsub))
+        except Exception:
+            ...
+
+        try:
+            unsub = self.realsense_image.subscribe(self._on_realsense_image)
+            self._disposables.add(Disposable(unsub))
+        except Exception:
+            ...
+
+        try:
+            unsub = self.realsense_depth.subscribe(self._on_realsense_depth)
             self._disposables.add(Disposable(unsub))
         except Exception:
             ...
@@ -458,6 +474,24 @@ class WebsocketVisModule(Module[WebsocketConfig]):
         if b64:
             self._emit("debug_depth_image", b64)
 
+    def _on_realsense_image(self, msg: Image) -> None:
+        now = time.time()
+        if now - self._last_rs_color_emit < self._image_emit_interval:
+            return
+        self._last_rs_color_emit = now
+        b64 = self._image_to_base64(msg)
+        if b64:
+            self._emit("debug_rs_color_image", b64)
+
+    def _on_realsense_depth(self, msg: Image) -> None:
+        now = time.time()
+        if now - self._last_rs_depth_emit < self._image_emit_interval:
+            return
+        self._last_rs_depth_emit = now
+        b64 = self._image_to_base64(msg, is_depth=True)
+        if b64:
+            self._emit("debug_rs_depth_image", b64)
+
     @staticmethod
     def _image_to_base64(img: Image, is_depth: bool = False) -> str | None:
         """Encode a DimOS Image to a base64 JPEG string."""
@@ -522,23 +556,34 @@ _DEBUG_IMAGES_HTML = """\
 <h1>NavDP Debug Images</h1>
 <div class="grid">
   <div class="panel">
-    <h2>Color Image</h2>
+    <h2>Go2 Color Image</h2>
     <img id="color" alt="waiting for color image..." />
     <div class="status" id="color-status">Waiting...</div>
   </div>
   <div class="panel">
-    <h2>Depth Image</h2>
+    <h2>Go2 Depth Image</h2>
     <img id="depth" alt="waiting for depth image..." />
     <div class="status" id="depth-status">Waiting...</div>
+  </div>
+  <div class="panel">
+    <h2>D435i RGB</h2>
+    <img id="rs-color" alt="waiting for D435i color..." />
+    <div class="status" id="rs-color-status">Waiting...</div>
+  </div>
+  <div class="panel">
+    <h2>D435i Depth</h2>
+    <img id="rs-depth" alt="waiting for D435i depth..." />
+    <div class="status" id="rs-depth-status">Waiting...</div>
   </div>
 </div>
 <script>
   const socket = io({ transports: ['websocket', 'polling'] });
-  let colorCount = 0, depthCount = 0;
+  let colorCount = 0, depthCount = 0, rsColorCount = 0, rsDepthCount = 0;
 
   socket.on('connect', () => {
-    document.getElementById('color-status').textContent = 'Connected, waiting for frames...';
-    document.getElementById('depth-status').textContent = 'Connected, waiting for frames...';
+    ['color-status','depth-status','rs-color-status','rs-depth-status'].forEach(
+      id => document.getElementById(id).textContent = 'Connected, waiting for frames...'
+    );
   });
 
   socket.on('debug_color_image', (b64) => {
@@ -553,9 +598,22 @@ _DEBUG_IMAGES_HTML = """\
     document.getElementById('depth-status').textContent = 'Frame #' + depthCount;
   });
 
+  socket.on('debug_rs_color_image', (b64) => {
+    rsColorCount++;
+    document.getElementById('rs-color').src = 'data:image/jpeg;base64,' + b64;
+    document.getElementById('rs-color-status').textContent = 'Frame #' + rsColorCount;
+  });
+
+  socket.on('debug_rs_depth_image', (b64) => {
+    rsDepthCount++;
+    document.getElementById('rs-depth').src = 'data:image/jpeg;base64,' + b64;
+    document.getElementById('rs-depth-status').textContent = 'Frame #' + rsDepthCount;
+  });
+
   socket.on('disconnect', () => {
-    document.getElementById('color-status').textContent = 'Disconnected';
-    document.getElementById('depth-status').textContent = 'Disconnected';
+    ['color-status','depth-status','rs-color-status','rs-depth-status'].forEach(
+      id => document.getElementById(id).textContent = 'Disconnected'
+    );
   });
 </script>
 </body>
