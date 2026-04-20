@@ -62,6 +62,7 @@ from dimos.msgs.geometry_msgs.Twist import Twist
 from dimos.msgs.geometry_msgs.Vector3 import Vector3
 from dimos.msgs.nav_msgs.OccupancyGrid import CostValues, OccupancyGrid
 from dimos.msgs.nav_msgs.Path import Path
+from dimos.msgs.sensor_msgs.CameraInfo import CameraInfo
 from dimos.msgs.sensor_msgs.Image import Image
 from dimos.navigation.base import NavigationInterface, NavigationState
 from dimos.navigation.navdp.trajectory_selector import TrajectorySelector
@@ -192,6 +193,7 @@ class NavDPNavigator(Module, NavigationInterface):
     global_costmap: In[OccupancyGrid]
     explore_cmd: In[Bool]
     stop_explore_cmd: In[Bool]
+    realsense_camera_info: In[CameraInfo]
     cmd_vel: Out[Twist]
     navdp_path: Out[Path]
 
@@ -249,6 +251,10 @@ class NavDPNavigator(Module, NavigationInterface):
         self._hold_duration_s = hold_duration_s
         self._decel_duration_s = decel_duration_s
         self._enable_internal_vlm = enable_internal_vlm
+
+        # Live CameraInfo from LcmRealsenseRelay (set when realsense_lcm profile is used)
+        self._camera_info_event: threading.Event = threading.Event()
+        self._live_camera_info: CameraInfo | None = None
 
         # Trajectory selector (costmap / LiDAR collision avoidance)
         sel_kwargs = dict(trajectory_selector_kwargs or {})
@@ -329,10 +335,28 @@ class NavDPNavigator(Module, NavigationInterface):
         self._odom_history: list[tuple[float, float, float, float]] = []  # (t, x, y, yaw)
         self._stuck_window: float = 3.0  # seconds of history to consider
         self._stuck_dist_thresh: float = 0.15  # metres; below this → stuck
-        self._stuck_rotate_duration: float = 2.0  # seconds to rotate when stuck
-        self._stuck_rotate_start: float = 0.0  # when current rotation started
-        self._is_rotating_to_escape: bool = False
         self._selector_halt_streak: int = 0
+
+        # Two-phase escape: backup first, then rotate toward frontier.
+        # Phase 0 = not escaping, 1 = backing up, 2 = rotating.
+        self._escape_phase: int = 0
+        self._escape_phase_start: float = 0.0
+        self._escape_backup_duration: float = 1.5    # seconds to back up
+        self._escape_backup_speed: float = -0.25     # m/s (negative = reverse)
+        self._escape_rotate_duration: float = 2.0    # seconds to rotate
+        self._escape_rotate_w: float = 0.5           # rad/s (updated by frontier dir)
+        # Cached frontier direction at the moment escape starts, so it
+        # doesn't change mid-maneuver.
+        self._escape_frontier_dir: tuple[float, float] | None = None
+        # Track consecutive escape attempts to escalate rotation aggressiveness
+        self._escape_attempt_count: int = 0
+
+        # Global path guidance from hybrid exploration (set via RPC from VLN skill).
+        # When set, _get_path_direction() extracts a pure-pursuit direction that
+        # replaces the raw frontier-direction hint in the trajectory selector.
+        # Protected by _lock (same as costmap / scan_points).
+        self._guidance_path: list[tuple[float, float]] | None = None
+        self._guidance_path_idx: int = 0
 
         # Exploration trail: subsampled (x, y) positions for the exploration
         # cost in the trajectory selector.  Updated every tick when the robot
@@ -373,12 +397,25 @@ class NavDPNavigator(Module, NavigationInterface):
             return
         nb = _navdp_bridge
 
-        # Initialize NavDP components
+        # Subscribe realsense_camera_info early so the event fires before we wait below
+        self._disposables.add(
+            Disposable(self.realsense_camera_info.subscribe(self._on_camera_info))
+        )
+
+        # Initialize NavDP components — wait for live CameraInfo if no static intrinsic set
         intrinsic = self._cam_intrinsic
         if intrinsic is None:
-            intrinsic = np.array(
-                [[460, 0, 320], [0, 460, 240], [0, 0, 1]], dtype=np.float32
-            )
+            logger.info("[NavDP] cam_intrinsic not set — waiting for CameraInfo from relay (up to 30s)...")
+            self._camera_info_event.wait(timeout=30.0)
+            if self._live_camera_info is not None:
+                K = np.array(self._live_camera_info.K, dtype=np.float32).reshape(3, 3)
+                intrinsic = K
+                logger.info("[NavDP] Using live CameraInfo intrinsic: %s", intrinsic)
+            else:
+                intrinsic = np.array(
+                    [[460, 0, 320], [0, 460, 240], [0, 0, 1]], dtype=np.float32
+                )
+                logger.warning("[NavDP] CameraInfo timeout — using default intrinsic")
         # Store resolved intrinsic for later reset() calls (e.g. after goal reached)
         self._intrinsic = intrinsic
 
@@ -502,6 +539,11 @@ class NavDPNavigator(Module, NavigationInterface):
 
     # --- Stream callbacks ---
 
+    def _on_camera_info(self, info: CameraInfo) -> None:
+        """Receive live CameraInfo from LcmRealsenseRelay and unblock start() if waiting."""
+        self._live_camera_info = info
+        self._camera_info_event.set()
+
     def _on_image(self, img: Image) -> None:
         """Go2 built-in camera — used for VLM detection only."""
         with self._lock:
@@ -596,8 +638,11 @@ class NavDPNavigator(Module, NavigationInterface):
         # cancel_goal so that retried searches benefit from knowing
         # where the robot has already been.  Use clear_exploration_trail()
         # for an explicit reset.
-        self._is_rotating_to_escape = False
+        self._escape_phase = 0
         self._selector_halt_streak = 0
+        self._escape_attempt_count = 0
+        self._guidance_path = None
+        self._guidance_path_idx = 0
         self._skip_vlm_detection = False
         self._object_direction = None
         self._idle_since = time.time()
@@ -652,6 +697,66 @@ class NavDPNavigator(Module, NavigationInterface):
         logger.info("NavDP exploration trail cleared")
         return True
 
+    @rpc
+    def get_explore_trail(self) -> list[tuple[float, float]]:
+        """Return a snapshot of the exploration trail as (x, y) world-frame points.
+
+        Each point is recorded when the robot moves at least
+        ``_explore_trail_sample_dist`` metres from the previous sample (default
+        0.5 m).  The list is ordered chronologically — earliest entry first,
+        most recent last — so reversing it gives the entry-path backtrack order.
+
+        Returns:
+            List of (x, y) tuples in world-frame metres.  Empty list if the
+            robot has not yet moved.
+        """
+        return list(self._explore_trail)
+
+    # --- Hybrid exploration path guidance RPCs ---
+
+    @rpc
+    def set_path_guidance(self, waypoints: list[list[float]]) -> bool:
+        """Set a global reference path computed by A* for hybrid exploration.
+
+        The path is a list of [x, y] world-frame positions (e.g. from
+        ``ReplanningAStarPlanner.compute_path_to_goal``).  During SEEK the
+        trajectory selector uses a pure-pursuit direction toward the look-ahead
+        point on this path instead of the raw nearest-frontier direction.
+
+        Args:
+            waypoints: Ordered list of [x, y] world-frame coordinates.
+                       First entry should be near the robot's current position.
+
+        Returns:
+            True on success.
+        """
+        with self._lock:
+            self._guidance_path = [(float(w[0]), float(w[1])) for w in waypoints]
+            self._guidance_path_idx = 0
+        print(
+            f"[NavDP] path guidance set: {len(waypoints)} waypoints",
+            flush=True,
+        )
+        return True
+
+    @rpc
+    def clear_path_guidance(self) -> bool:
+        """Clear the active path guidance (fall back to raw frontier direction)."""
+        with self._lock:
+            self._guidance_path = None
+            self._guidance_path_idx = 0
+        return True
+
+    @rpc
+    def get_escape_attempt_count(self) -> int:
+        """Return the number of consecutive escape attempts since the last free trajectory.
+
+        Used by the VLN skill container to detect dead-end situations and
+        trigger an immediate frontier replan without waiting for the normal
+        distance-based replan interval.
+        """
+        return self._escape_attempt_count
+
     # --- NavDP-specific RPCs ---
 
     @rpc
@@ -684,10 +789,14 @@ class NavDPNavigator(Module, NavigationInterface):
             self._nav_state = NavigationState.FOLLOWING_PATH
             self._last_vlm_mode = "unknown"
             self._last_vlm_conf = 0.0
-        # Reset stuck detection for the new goal
+        # Reset stuck detection and path guidance for the new goal
         self._odom_history.clear()
-        self._is_rotating_to_escape = False
+        self._escape_phase = 0
         self._selector_halt_streak = 0
+        self._escape_attempt_count = 0
+        with self._lock:
+            self._guidance_path = None
+            self._guidance_path_idx = 0
         if self._goal_context is not None:
             self._goal_context.set_language_goal(goal)
         if self._state_machine is not None:
@@ -860,6 +969,145 @@ class NavDPNavigator(Module, NavigationInterface):
             if len(self._explore_trail) > self._explore_trail_max_points:
                 self._explore_trail = self._explore_trail[-self._explore_trail_max_points:]
 
+    # --- Frontier direction ---
+
+    def _get_nearest_frontier_direction(
+        self,
+        odom: tuple[float, float, float],
+        costmap: OccupancyGrid | None,
+        search_radius_m: float = 5.0,
+    ) -> tuple[float, float] | None:
+        """Compute a unit vector from the robot toward the nearest frontier centroid.
+
+        A *frontier cell* is a FREE cell that has at least one UNKNOWN
+        neighbour (4-connected).  We search a square patch of the costmap
+        centred on the robot (side = 2 * search_radius_m) and return the
+        direction toward the centroid of the closest cluster of frontier
+        cells.
+
+        Returns ``(dx, dy)`` unit vector in world frame, or ``None`` if no
+        frontier is found within the search radius.
+        """
+        if costmap is None:
+            return None
+
+        grid = costmap.grid
+        res = costmap.resolution
+        if res <= 0 or grid.size == 0:
+            return None
+
+        ox, oy, _ = odom
+        robot_grid = costmap.world_to_grid((ox, oy, 0.0))
+        rgx, rgy = int(robot_grid.x), int(robot_grid.y)
+
+        h, w = grid.shape
+        radius_cells = int(math.ceil(search_radius_m / res))
+
+        # Clip search box to grid bounds
+        x_min = max(0, rgx - radius_cells)
+        x_max = min(w - 1, rgx + radius_cells)
+        y_min = max(0, rgy - radius_cells)
+        y_max = min(h - 1, rgy + radius_cells)
+        if x_min >= x_max or y_min >= y_max:
+            return None
+
+        patch = grid[y_min:y_max + 1, x_min:x_max + 1]
+        ph, pw = patch.shape
+
+        # Build FREE mask and UNKNOWN mask
+        free_mask = patch == CostValues.FREE
+        unknown_mask = patch == CostValues.UNKNOWN
+
+        # Frontier = FREE cell with at least one UNKNOWN 4-neighbour
+        frontier_mask = np.zeros_like(free_mask)
+        if ph > 1:
+            frontier_mask[1:, :] |= free_mask[1:, :] & unknown_mask[:-1, :]   # up
+            frontier_mask[:-1, :] |= free_mask[:-1, :] & unknown_mask[1:, :]  # down
+        if pw > 1:
+            frontier_mask[:, 1:] |= free_mask[:, 1:] & unknown_mask[:, :-1]   # left
+            frontier_mask[:, :-1] |= free_mask[:, :-1] & unknown_mask[:, 1:]  # right
+
+        frontier_ys, frontier_xs = np.where(frontier_mask)
+        if len(frontier_xs) == 0:
+            return None
+
+        # Convert frontier cells back to world coordinates
+        world_xs = (frontier_xs + x_min) * res + costmap.origin.position.x
+        world_ys = (frontier_ys + y_min) * res + costmap.origin.position.y
+
+        # Find the N closest frontier cells and use their centroid
+        dists_sq = (world_xs - ox) ** 2 + (world_ys - oy) ** 2
+        n_closest = min(50, len(dists_sq))
+        closest_idx = np.argpartition(dists_sq, n_closest)[:n_closest]
+
+        cx = float(world_xs[closest_idx].mean())
+        cy = float(world_ys[closest_idx].mean())
+
+        dx = cx - ox
+        dy = cy - oy
+        dist = math.sqrt(dx * dx + dy * dy)
+        if dist < 1e-6:
+            return None
+
+        return (dx / dist, dy / dist)
+
+    def _get_path_direction(
+        self,
+        odom: tuple[float, float, float],
+        lookahead_m: float = 2.0,
+    ) -> tuple[float, float] | None:
+        """Return a unit vector from the robot toward the look-ahead point on the guidance path.
+
+        Implements pure-pursuit style look-ahead: advances the tracked index to
+        the closest waypoint ahead, then walks forward along the path until
+        ``lookahead_m`` cumulative distance is covered and returns the direction
+        to that target point.
+
+        Returns ``(dx, dy)`` world-frame unit vector, or ``None`` when no
+        guidance path is set or the path has been exhausted.
+        """
+        with self._lock:
+            path = self._guidance_path
+            idx = self._guidance_path_idx
+
+        if path is None or len(path) < 2:
+            return None
+
+        ox, oy, _ = odom
+
+        # Advance index to the closest waypoint within the next 20 entries,
+        # ensuring the tracked point stays near the robot.
+        search_end = min(idx + 20, len(path))
+        best_idx = idx
+        best_dist = float("inf")
+        for i in range(idx, search_end):
+            d = math.hypot(path[i][0] - ox, path[i][1] - oy)
+            if d < best_dist:
+                best_dist = d
+                best_idx = i
+        with self._lock:
+            self._guidance_path_idx = best_idx
+
+        # Walk forward from best_idx until we accumulate lookahead_m distance
+        cum_dist = 0.0
+        target_idx = best_idx
+        for i in range(best_idx, len(path) - 1):
+            seg = math.hypot(
+                path[i + 1][0] - path[i][0],
+                path[i + 1][1] - path[i][1],
+            )
+            cum_dist += seg
+            target_idx = i + 1
+            if cum_dist >= lookahead_m:
+                break
+
+        tx, ty = path[target_idx]
+        dx, dy = tx - ox, ty - oy
+        mag = math.hypot(dx, dy)
+        if mag < 1e-6:
+            return None
+        return (dx / mag, dy / mag)
+
     # --- VLM detection (background, periodic) ---
 
     def _run_vlm_detection(self, image: np.ndarray) -> None:
@@ -880,7 +1128,12 @@ class NavDPNavigator(Module, NavigationInterface):
                 self._last_vlm_conf = result.get("confidence", 0.0)
                 self._vlm_result_fresh = True
         except Exception:
-            logger.debug("VLM detection query failed", exc_info=True)
+            # Rate-limited warning so repeated failures are visible in logs
+            # without flooding at 1 Hz.
+            _now = time.time()
+            if _now - getattr(self, "_last_vlm_fail_log", 0.0) > 10.0:
+                self._last_vlm_fail_log = _now
+                logger.warning("VLM detection query failed (last 10s)", exc_info=True)
 
     # --- Visualization ---
 
@@ -1084,9 +1337,15 @@ class NavDPNavigator(Module, NavigationInterface):
                 inf_ms = (time.time() - t_inf) * 1000
 
                 if infer_count == 0:
+                    _vals_range = (
+                        f"[{float(all_vals.min()):.3f}, {float(all_vals.max()):.3f}]"
+                        if all_vals is not None else "None"
+                    )
                     print(
                         f"[NavDP] FIRST inference result: mode={mode}, "
                         f"traj={traj.shape if traj is not None else None}, "
+                        f"all_traj={all_traj.shape if all_traj is not None else None}, "
+                        f"all_vals_range={_vals_range}, "
                         f"time={inf_ms:.0f}ms, server={self._navdp_url}",
                         flush=True,
                     )
@@ -1508,6 +1767,18 @@ class NavDPNavigator(Module, NavigationInterface):
                 else None
             )
 
+            # Compute directional hint for SEEK — prefer A* path guidance when
+            # available (hybrid mode), fall back to nearest frontier direction.
+            if _is_seeking:
+                _path_dir = self._get_path_direction(ctx.odom)
+                _frontier_dir = (
+                    _path_dir
+                    if _path_dir is not None
+                    else self._get_nearest_frontier_direction(ctx.odom, costmap)
+                )
+            else:
+                _frontier_dir = None
+
             sel_result = self._trajectory_selector.select(
                 selected_traj=traj,
                 all_trajectories=ctx.all_traj,
@@ -1520,7 +1791,12 @@ class NavDPNavigator(Module, NavigationInterface):
                 is_seeking=_is_seeking,
                 depth_image=ctx.sm_depth,
                 object_direction=self._object_direction,
+                frontier_direction=_frontier_dir,
             )
+            # Stash for downstream diagnostic (publish-time log).
+            self._last_sel_fallback = bool(sel_result.fallback_used)
+            self._last_sel_index = int(sel_result.index)
+            self._last_sel_cost = float(sel_result.cost)
             if sel_result.fallback_used:
                 self._selector_halt_streak += 1
                 # All trajectories collide — zero velocity but do NOT return
@@ -1529,7 +1805,15 @@ class NavDPNavigator(Module, NavigationInterface):
                 ctx.w = 0.0
                 ctx.waypoints = np.zeros((0, 2), dtype=np.float32)
             else:
-                self._selector_halt_streak = 0
+                # Decrement rather than reset — a single free trajectory amid
+                # many all-collide ticks should NOT fully clear the streak.
+                # This prevents the robot from slowly creeping into walls when
+                # only 1/8 trajectories is occasionally collision-free.
+                self._selector_halt_streak = max(0, self._selector_halt_streak - 2)
+                # Once escape has succeeded and we have a free trajectory again,
+                # reset the attempt counter so the next stuck episode starts fresh.
+                if self._escape_phase == 0 and self._selector_halt_streak == 0:
+                    self._escape_attempt_count = 0
                 traj = sel_result.trajectory
                 ctx.waypoints = None  # recomputed below
 
@@ -1573,31 +1857,106 @@ class NavDPNavigator(Module, NavigationInterface):
                 ctx.v = 0.15 if abs(angle) < 0.5 else 0.0
                 ctx.w = max(-0.5, min(0.5, angle))
 
-        # --- Odom-based stuck detection (fallback when LiDAR is unavailable) ---
+        # --- Two-phase escape: backup then rotate toward frontier ---
         now = time.time()
         selector_stuck = self._selector_halt_streak >= 4
-        if self._is_rotating_to_escape:
-            elapsed = now - self._stuck_rotate_start
-            if elapsed < self._stuck_rotate_duration:
-                ctx.v = 0.0
-                ctx.w = 0.5  # rotate in place
+
+        if self._escape_phase == 1:
+            # Phase 1: backing up
+            elapsed = now - self._escape_phase_start
+            if elapsed < self._escape_backup_duration:
+                ctx.v = self._escape_backup_speed  # negative = reverse
+                ctx.w = 0.0
             else:
-                # Done rotating — clear history so the policy can try a new direction.
-                self._is_rotating_to_escape = False
+                # Transition to phase 2: rotate toward frontier
+                self._escape_phase = 2
+                self._escape_phase_start = now
+
+                # Determine rotation direction from cached frontier direction.
+                # frontier_dir is (dx, dy) world-frame unit vector toward
+                # the nearest frontier.  Convert to a target yaw and compute
+                # the signed angular difference from the robot's current yaw.
+                # On repeated attempts, override with larger forced rotation angles
+                # in alternating directions to prevent getting locked in same spot.
+                fdir = self._escape_frontier_dir
+                attempt = self._escape_attempt_count
+                if attempt >= 3:
+                    # Escalate: force a 180° rotation, alternating left/right
+                    forced_angle = math.pi if (attempt % 2 == 0) else -math.pi 
+                    self._escape_rotate_w = math.copysign(0.5, forced_angle)
+                    # Extend rotation duration proportionally
+                    self._escape_rotate_duration = abs(forced_angle) / 0.5
+                elif attempt >= 1:
+                    # Second attempt: force 90° rotation away from wall,
+                    # alternating direction each time
+                    forced_angle = (math.pi / 2) * (1 if attempt % 2 == 0 else -1)
+                    self._escape_rotate_w = math.copysign(0.5, forced_angle)
+                    self._escape_rotate_duration = abs(forced_angle) / 0.5
+                elif fdir is not None:
+                    target_yaw = math.atan2(fdir[1], fdir[0])
+                    _, _, cur_yaw = odom
+                    # Signed shortest-arc difference
+                    diff = (target_yaw - cur_yaw + math.pi) % (2 * math.pi) - math.pi
+                    self._escape_rotate_w = max(-0.5, min(0.5, diff / self._escape_rotate_duration))
+                else:
+                    self._escape_rotate_w = 0.5  # default: turn left
+
+                ctx.v = 0.0
+                ctx.w = self._escape_rotate_w
+                print(
+                    f"[NavDP] escape phase 2: rotating w={self._escape_rotate_w:.2f} "
+                    f"for {self._escape_rotate_duration:.1f}s "
+                    f"(attempt={attempt}, frontier={'yes' if fdir is not None else 'no'})",
+                    flush=True,
+                )
+
+        elif self._escape_phase == 2:
+            # Phase 2: rotating toward frontier
+            elapsed = now - self._escape_phase_start
+            if elapsed < self._escape_rotate_duration:
+                ctx.v = 0.0
+                ctx.w = self._escape_rotate_w
+            else:
+                # Escape complete — resume normal policy
+                self._escape_phase = 0
                 self._odom_history.clear()
                 self._selector_halt_streak = 0
-                logger.info("NavDP stuck-escape rotation complete, resuming policy")
+                # Reset rotation duration to default for next escape
+                self._escape_rotate_duration = 2.0
+                print(
+                    f"[NavDP] escape complete (backup+rotate attempt #{self._escape_attempt_count}), resuming policy",
+                    flush=True,
+                )
+
         elif selector_stuck or self._check_stuck(odom):
-            self._is_rotating_to_escape = True
-            self._stuck_rotate_start = now
+            # Trigger escape: start phase 1 (backup)
+            self._escape_phase = 1
+            self._escape_phase_start = now
+            self._escape_attempt_count += 1
             trigger_reason = "selector_halt_streak" if selector_stuck else "odom_progress"
-            ctx.v = 0.0
-            ctx.w = 0.5
-            logger.info(
-                "NavDP stuck detected at (%.2f, %.2f) via %s — rotating to escape",
-                odom[0],
-                odom[1],
-                trigger_reason,
+
+            # If stuck repeatedly, the guidance path likely leads into a dead-end — discard it
+            if self._escape_attempt_count >= 2 and self._guidance_path is not None:
+                with self._lock:
+                    self._guidance_path = None
+                    self._guidance_path_idx = 0
+                print("[NavDP] Cleared stale guidance path after 2+ escape attempts", flush=True)
+
+            # Cache the frontier direction now so it doesn't change mid-maneuver
+            with self._lock:
+                costmap = self._latest_costmap
+            self._escape_frontier_dir = self._get_nearest_frontier_direction(odom, costmap)
+
+            ctx.v = self._escape_backup_speed
+            ctx.w = 0.0
+            print(
+                f"[NavDP] stuck at ({odom[0]:.2f}, {odom[1]:.2f}) via {trigger_reason} "
+                f"— escape phase 1: backup {abs(self._escape_backup_speed):.2f}m/s "
+                f"for {self._escape_backup_duration:.1f}s "
+                f"(attempt #{self._escape_attempt_count}, "
+                f"streak={self._selector_halt_streak}, "
+                f"frontier={'yes' if self._escape_frontier_dir is not None else 'no'})",
+                flush=True,
             )
 
         return False
@@ -1622,6 +1981,49 @@ class NavDPNavigator(Module, NavigationInterface):
             linear=Vector3(x=float(ctx.v), y=0.0, z=0.0),
             angular=Vector3(x=0.0, y=0.0, z=float(ctx.w)),
         )
+
+        # --- Diagnostic: catch the case where selector requested a halt
+        # (fallback_used=True) but cmd_vel is still non-zero.  That would
+        # mean hold/decel or escape override re-introduced velocity; the
+        # caller should see it in logs to track down the wall-drift bug. ---
+        _fb = getattr(self, "_last_sel_fallback", False)
+        _nonzero = abs(float(twist.linear.x)) > 1e-3 or abs(float(twist.angular.z)) > 1e-3
+        if _fb and _nonzero:
+            # Unthrottled — this is the exact "walked into wall" signature.
+            print(
+                f"[NavDP-DIAG] selector halted but cmd_vel non-zero: "
+                f"v={twist.linear.x:.3f} w={twist.angular.z:.3f} "
+                f"sel_idx={getattr(self, '_last_sel_index', -1)} "
+                f"sel_cost={getattr(self, '_last_sel_cost', 0.0):.1f} "
+                f"escape_phase={self._escape_phase} "
+                f"halt_streak={self._selector_halt_streak}",
+                flush=True,
+            )
+        elif not hasattr(self, "_cmd_vel_diag_tick"):
+            self._cmd_vel_diag_tick = 0
+        else:
+            self._cmd_vel_diag_tick += 1
+            if self._cmd_vel_diag_tick % 30 == 1:  # ~every 5s at 6Hz
+                _sm_state_str = "?"
+                try:
+                    _sm_state_str = self._state_machine.state.name
+                except Exception:
+                    pass
+                _trail_len = len(self._exploration_trail) if hasattr(self, "_exploration_trail") else 0
+                _guidance_wps = len(self._guidance_path) if getattr(self, "_guidance_path", None) is not None else 0
+                print(
+                    f"[NavDP-DIAG] cmd_vel v={twist.linear.x:.3f} w={twist.angular.z:.3f} "
+                    f"nav={self._nav_state.name} sm={_sm_state_str} "
+                    f"goal='{self._language_goal[:30]}' infer={self._infer_mode} "
+                    f"skip_vlm={self._skip_vlm_detection} "
+                    f"sel_fallback={_fb} sel_idx={getattr(self, '_last_sel_index', -1)} "
+                    f"sel_cost={getattr(self, '_last_sel_cost', 0.0):.1f} "
+                    f"escape_phase={self._escape_phase} "
+                    f"halt_streak={self._selector_halt_streak} "
+                    f"trail_len={_trail_len} guidance_wps={_guidance_wps}",
+                    flush=True,
+                )
+
         self.cmd_vel.publish(twist)
         # Track last good velocity for graceful network-failure hold/decel
         self._last_good_v = float(twist.linear.x)

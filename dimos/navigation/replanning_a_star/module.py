@@ -109,6 +109,17 @@ class ReplanningAStarPlanner(Module, NavigationInterface):
         return True
 
     @rpc
+    def compute_path_to_goal(self, goal: PoseStamped) -> Path | None:
+        """Compute an A* path to goal without starting navigation.
+
+        Returns the planned ``Path`` (resampled at 0.1 m) or ``None`` when the
+        goal is unreachable.  cmd_vel is never published — this is a pure
+        path-query used by hybrid NavDP exploration so the global path can be
+        sent to NavDPNavigator as a guidance signal.
+        """
+        return self._planner.compute_path_to_goal(goal)
+
+    @rpc
     def set_replanning_enabled(self, enabled: bool) -> None:
         self._planner.set_replanning_enabled(enabled)
 

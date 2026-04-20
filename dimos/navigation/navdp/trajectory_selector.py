@@ -119,6 +119,12 @@ class TrajectorySelector:
         When the minimum depth in the camera's central strip is below this
         distance (metres), forward-pointing trajectories receive a collision
         penalty.  Set to 0 to disable.
+    frontier_weight : float
+        Reward weight for the frontier direction term.  During SEEK, the
+        selector computes the direction toward the nearest frontier
+        (free/unknown boundary) on the costmap and rewards trajectories
+        whose endpoints align with that direction.  This pulls the robot
+        toward unexplored space and helps it escape dead ends.
     """
 
     def __init__(
@@ -135,6 +141,8 @@ class TrajectorySelector:
         horizon_m: float = 1.5,
         sample_step: int = 2,
         max_trajectory_cost: float = 50.0,
+        min_trajectory_length: float = 0.3,
+        critic_min_accept: float = -5.0,
         explore_weight: float = 5.0,
         explore_radius: float = 2.0,
         explore_endpoint_bonus: float = 1.0,
@@ -143,6 +151,7 @@ class TrajectorySelector:
         open_space_radius: float = 0.6,
         depth_obstacle_m: float = 0.5,
         direction_weight: float = 3.0,
+        frontier_weight: float = 5.0,
     ) -> None:
         self._enabled = enabled
         self.cost_threshold = cost_threshold
@@ -156,6 +165,19 @@ class TrajectorySelector:
         self.horizon_m = horizon_m
         self.sample_step = max(1, sample_step)
         self.max_trajectory_cost = max_trajectory_cost
+        # Degenerate-trajectory filter.  NavDP can emit near-zero-length
+        # trajectories that have no collision risk (they don't move) but
+        # also don't advance the robot; picking one leads to the robot
+        # freezing in front of a wall.  Reject anything whose cumulative
+        # path length is below this threshold (metres).
+        self.min_trajectory_length = max(0.0, float(min_trajectory_length))
+        # NavDP's critic returns ~-10 for trajectories it considers unsafe
+        # ("no good direction").  When every surviving candidate has a
+        # critic below this value the robot is effectively cornered, even
+        # if the footprint check says "no collision" (because the short
+        # stay-put trajectory never reaches a wall cell).  Treat this as
+        # a stall and ask the caller to escape instead of inching forward.
+        self.critic_min_accept = float(critic_min_accept)
         self.explore_weight = explore_weight
         self.explore_radius = max(0.01, explore_radius)
         self.explore_endpoint_bonus = explore_endpoint_bonus
@@ -164,6 +186,14 @@ class TrajectorySelector:
         self.open_space_radius = max(0.0, open_space_radius)
         self.depth_obstacle_m = depth_obstacle_m
         self.direction_weight = direction_weight
+        self.frontier_weight = frontier_weight
+
+        # Cache of the most recent costmap.  The CostMapper typically runs at
+        # a lower rate than NavDP (6 Hz inference), so `costmap` is None on
+        # many ticks.  Using a stale-but-valid costmap beats disabling the
+        # collision check entirely — which is what caused the selector to
+        # drive the robot into desks / walls.
+        self._latest_costmap: OccupancyGrid | None = None
 
     # ------------------------------------------------------------------
     # Enable / disable
@@ -198,6 +228,7 @@ class TrajectorySelector:
         is_seeking: bool = False,
         depth_image: np.ndarray | None = None,
         object_direction: str | None = None,
+        frontier_direction: tuple[float, float] | None = None,
     ) -> SelectionResult:
         """Select the best trajectory from candidates.
 
@@ -246,6 +277,95 @@ class TrajectorySelector:
                 fallback_used=False,
             )
 
+        # --- Costmap cache: CostMapper runs slower than NavDP; reuse the
+        # latest known costmap when the caller passes None so obstacle
+        # checks stay active on ticks without a fresh map. ---
+        if costmap is not None:
+            self._latest_costmap = costmap
+        else:
+            costmap = self._latest_costmap
+
+        # Unpack odom here so the diagnostic probe below can reference ox/oy
+        # without causing a NameError (the main loop unpacks it again below).
+        ox, oy, oyaw = odom
+
+        # --- Diagnostic: log costmap and trajectory info every ~5s ---
+        if not hasattr(self, '_diag_tick'):
+            self._diag_tick = 0
+        self._diag_tick += 1
+        _do_diag = (self._diag_tick % 30 == 1)  # ~every 5s at 6Hz
+        if _do_diag:
+            if costmap is not None:
+                grid = costmap.grid
+                n_occupied = int((grid >= self.cost_threshold).sum())
+                n_unknown = int((grid == -1).sum())
+                n_free = int((grid == 0).sum())
+                print(
+                    f"[TrajSel-DIAG] costmap {costmap.width}x{costmap.height} "
+                    f"res={costmap.resolution:.3f}m "
+                    f"origin=({costmap.origin.position.x:.2f},{costmap.origin.position.y:.2f}) "
+                    f"cells: free={n_free} occ={n_occupied} unk={n_unknown} "
+                    f"threshold={self.cost_threshold}",
+                    flush=True,
+                )
+
+                # Cost-value distribution — use to pick cost_threshold.
+                # Walls should concentrate in the high buckets; floor noise
+                # in the low buckets.  Percentiles are computed over observed
+                # (non -1) cells only.
+                nonneg = grid[grid >= 0]
+                if nonneg.size:
+                    pct = np.percentile(nonneg, [50, 75, 90, 95, 99]).astype(int).tolist()
+                    hist = np.bincount(
+                        np.clip(nonneg, 0, 100).astype(np.int64), minlength=101
+                    )
+                    buckets = [int(hist[i:i + 10].sum()) for i in range(0, 100, 10)]
+                    buckets.append(int(hist[100]))  # exact-100 bucket
+                    print(
+                        f"[TrajSel-DIAG] cost pct50/75/90/95/99={pct} "
+                        f"buckets[0-10,10-20,...,90-100,==100]={buckets}",
+                        flush=True,
+                    )
+
+                # --- Odom ↔ costmap alignment probe ---
+                # Sample a 0.5 m box of cells centered on the robot's
+                # odom (ox, oy).  If odom is well-aligned with the costmap,
+                # max_cost here should be LOW (robot stands on free ground).
+                # If odom has drifted and the robot is virtually inside a
+                # wall, max_cost will be >= cost_threshold — which explains
+                # the apparent "selector ignores walls" behaviour.
+                try:
+                    res = costmap.resolution
+                    half = int(round(0.5 / res))
+                    gv = costmap.world_to_grid((ox, oy, 0.0))
+                    cx, cy = int(gv.x), int(gv.y)
+                    gx0 = max(0, cx - half)
+                    gx1 = min(costmap.width, cx + half + 1)
+                    gy0 = max(0, cy - half)
+                    gy1 = min(costmap.height, cy + half + 1)
+                    if gx1 > gx0 and gy1 > gy0:
+                        patch = grid[gy0:gy1, gx0:gx1]
+                        probe_max = int(patch.max())
+                        probe_occ_frac = float(
+                            (patch >= self.cost_threshold).sum()
+                        ) / patch.size
+                        probe_cell_at_robot = (
+                            int(grid[cy, cx])
+                            if 0 <= cx < costmap.width and 0 <= cy < costmap.height
+                            else -999
+                        )
+                        print(
+                            f"[TrajSel-DIAG] odom_probe robot=({ox:.2f},{oy:.2f}) "
+                            f"cell_at_robot={probe_cell_at_robot} "
+                            f"0.5m_box_max_cost={probe_max} "
+                            f"occ_frac={probe_occ_frac:.2%}",
+                            flush=True,
+                        )
+                except Exception as e:  # noqa: BLE001
+                    print(f"[TrajSel-DIAG] odom_probe failed: {e}", flush=True)
+            else:
+                print("[TrajSel-DIAG] costmap=None — collision check disabled", flush=True)
+
         # Squeeze batch dim: (1, K, T, 3) → (K, T, 3)
         trajs = all_trajectories
         if trajs.ndim == 4:
@@ -258,7 +378,6 @@ class TrajectorySelector:
         costs = np.full(k, np.inf)
         collision_mask = np.zeros(k, dtype=bool)
 
-        ox, oy, oyaw = odom
         cos_yaw = math.cos(oyaw)
         sin_yaw = math.sin(oyaw)
 
@@ -273,6 +392,27 @@ class TrajectorySelector:
             waypoints_world = self._base_to_world(
                 waypoints_base, ox, oy, cos_yaw, sin_yaw
             )
+
+            # --- Degenerate-trajectory filter ---
+            # Short / stationary trajectories pass every collision check
+            # trivially (they don't move) but produce tiny (v, w) commands
+            # that leave the robot frozen in front of walls.  Treat them
+            # as invalid so the selector picks a trajectory that actually
+            # advances — or falls back to an escape manoeuvre.
+            if self.min_trajectory_length > 0.0 and len(waypoints_base) >= 2:
+                seg = np.diff(waypoints_base[:, :2], axis=0)
+                path_len = float(np.linalg.norm(seg, axis=1).sum())
+                if path_len < self.min_trajectory_length:
+                    collision_mask[i] = True
+                    costs[i] = self.collision_penalty
+                    # Log all degenerate rejections (not just traj#0) so we
+                    # can see how many candidates are stay-put on each tick.
+                    # print(
+                    #     f"[TrajSel] traj#{i} degenerate: path_len={path_len:.3f}m "
+                    #     f"< min={self.min_trajectory_length:.2f}m",
+                    #     flush=True,
+                    # )
+                    continue
 
             # --- Costmap-based collision (OBB footprint) ---
             cost = 0.0
@@ -294,6 +434,41 @@ class TrajectorySelector:
                     )
                     cost += fr_cost
                     collides = collides or fr_collides
+
+                # Diagnostic: show traj #0 waypoint range vs costmap bounds
+
+                if _do_diag and i == 0:
+                    wp_min = waypoints_world.min(axis=0)
+                    wp_max = waypoints_world.max(axis=0)
+                    grid_ox = costmap.origin.position.x
+                    grid_oy = costmap.origin.position.y
+                    grid_ex = grid_ox + costmap.width * costmap.resolution
+                    grid_ey = grid_oy + costmap.height * costmap.resolution
+                    in_bounds = (
+                        wp_min[0] >= grid_ox and wp_max[0] <= grid_ex and
+                        wp_min[1] >= grid_oy and wp_max[1] <= grid_ey
+                    )
+                    n_obs = len(obstacle_pts)
+                    # Sample max cell values along traj #0 waypoints
+                    sample_cells = []
+                    for wi in range(min(5, len(waypoints_world))):
+                        wx_s, wy_s = waypoints_world[wi]
+                        gv = costmap.world_to_grid((wx_s, wy_s, 0.0))
+                        gx_s, gy_s = int(gv.x), int(gv.y)
+                        if 0 <= gx_s < costmap.width and 0 <= gy_s < costmap.height:
+                            sample_cells.append(int(costmap.grid[gy_s, gx_s]))
+                        else:
+                            sample_cells.append("OOB")
+                    print(
+                        f"[TrajSel-DIAG] traj#0 wp_range x=[{wp_min[0]:.2f},{wp_max[0]:.2f}] "
+                        f"y=[{wp_min[1]:.2f},{wp_max[1]:.2f}] "
+                        f"costmap_bounds x=[{grid_ox:.2f},{grid_ex:.2f}] y=[{grid_oy:.2f},{grid_ey:.2f}] "
+                        f"in_bounds={in_bounds} robot=({ox:.2f},{oy:.2f}) "
+                        f"nearby_obs={n_obs} cm_cost={cm_cost:.1f} cm_col={cm_collides} "
+                        f"sample_cell_values={sample_cells}",
+                        flush=True,
+                    )
+                    
             elif scan_points is not None:
                 # LiDAR fallback
                 li_cost, li_collides = self._lidar_cost(
@@ -359,6 +534,21 @@ class TrajectorySelector:
                 dir_reward = self._direction_reward(waypoints_base, object_direction)
                 total -= dir_reward * self.direction_weight
 
+            # Frontier direction reward: during SEEK, bias trajectories
+            # toward the nearest frontier (free/unknown boundary) on the
+            # costmap.  This gives the robot a persistent pull toward
+            # unexplored space and helps it escape dead ends and rooms.
+            if (
+                is_seeking
+                and frontier_direction is not None
+                and self.frontier_weight > 0
+                and len(waypoints_world) >= 2
+            ):
+                fr_reward = self._frontier_direction_reward(
+                    waypoints_world, frontier_direction
+                )
+                total -= fr_reward * self.frontier_weight
+
             costs[i] = total
 
         # Select best non-colliding trajectory
@@ -377,6 +567,35 @@ class TrajectorySelector:
                 f"(cost={best_cost:.1f}, critic={best_critic:.3f})",
                 flush=True,
             )
+            # Per-component cost breakdown for the winner (every diag tick).
+            if _do_diag and vals is not None:
+                _w = best_idx
+                _cm_cost_w, _ = self._costmap_cost(
+                    self._base_to_world(
+                        traj_to_waypoints_fn(trajs[_w]),
+                        ox, oy, cos_yaw, sin_yaw,
+                    ),
+                    costmap,
+                ) if costmap is not None else (0.0, False)
+                _critic_r = float(vals[_w]) * self.critic_weight
+                _open_f = (
+                    self._open_space_reward(
+                        self._base_to_world(
+                            traj_to_waypoints_fn(trajs[_w]),
+                            ox, oy, cos_yaw, sin_yaw,
+                        ),
+                        costmap,
+                    )
+                    if costmap is not None else 0.0
+                )
+                print(
+                    f"[TrajSel-DIAG] winner traj#{_w} breakdown: "
+                    f"cm_cost={_cm_cost_w * self.costmap_weight:.2f} "
+                    f"critic_reward={_critic_r:.2f} "
+                    f"open_space_reward={_open_f * self.open_space_weight:.2f} "
+                    f"total={best_cost:.2f}",
+                    flush=True,
+                )
             if (
                 self.max_trajectory_cost is not None
                 and best_cost > self.max_trajectory_cost
@@ -384,6 +603,28 @@ class TrajectorySelector:
                 print(
                     f"[TrajectorySelector] Best cost {best_cost:.1f} exceeds "
                     f"threshold {self.max_trajectory_cost:.1f} → rejecting, robot should wait",
+                    flush=True,
+                )
+                return SelectionResult(
+                    trajectory=selected_traj,
+                    index=-1,
+                    cost=best_cost,
+                    costs=costs,
+                    collision_mask=collision_mask,
+                    fallback_used=True,
+                )
+
+            # Critic floor: NavDP itself says "this trajectory is unsafe"
+            # (critic ≈ -10) for every survivor.  Don't pick one — signal
+            # stall so the caller can trigger an escape/reorient.
+            if (
+                vals is not None
+                and best_critic < self.critic_min_accept
+            ):
+                print(
+                    f"[TrajectorySelector] Best critic {best_critic:.2f} below "
+                    f"floor {self.critic_min_accept:.2f} → all candidates unsafe, "
+                    f"rejecting to trigger escape",
                     flush=True,
                 )
                 return SelectionResult(
@@ -498,6 +739,13 @@ class TrajectorySelector:
             if cell_max >= self.cost_threshold:
                 has_collision = True
                 observed_cost += self.collision_penalty
+                if not hasattr(self, '_obb_collision_logged'):
+                    self._obb_collision_logged = True
+                    print(
+                        f"[TrajSel] OBB collision: cell_max={cell_max} >= threshold={self.cost_threshold} "
+                        f"at world=({wx:.2f},{wy:.2f})",
+                        flush=True,
+                    )
             elif cell_max == CostValues.UNKNOWN:
                 n_unknown += 1
             else:
@@ -746,13 +994,18 @@ class TrajectorySelector:
         depth_image: np.ndarray,
         waypoints_base: np.ndarray,
     ) -> tuple[float, bool]:
-        """Penalise forward-heading trajectories when depth shows a close obstacle.
+        """Penalise forward-heading trajectories when depth shows an obstacle ahead.
+
+        Two-tier penalty:
+        - Hard collision (depth < depth_obstacle_m, i.e. 0.5m): full collision
+          flag + full penalty.  Catches walls that are in the robot's immediate
+          path but not yet in the costmap.
+        - Soft warning (depth < 2*depth_obstacle_m, i.e. 1.0m): partial penalty
+          proportional to proximity.  Discourages heading toward walls 0.5-1.0m
+          away before they trigger the hard threshold.
 
         Samples the central vertical strip of the depth image (middle 40% of
         width, middle 60% of height) and computes the minimum valid depth.
-        If that depth is below ``depth_obstacle_m``, any trajectory whose
-        endpoint has a positive forward component (x > 0 in base_link) is
-        penalised proportionally.
 
         Returns (cost, has_collision).
         """
@@ -769,12 +1022,10 @@ class TrajectorySelector:
             return 0.0, False
 
         min_depth = float(valid.min())
-        if min_depth >= self.depth_obstacle_m:
-            return 0.0, False
+        soft_threshold = self.depth_obstacle_m * 2.0
 
-        # The closer the obstacle, the stronger the penalty
-        # severity: 1.0 when depth=0, 0.0 when depth=threshold
-        severity = 1.0 - min_depth / self.depth_obstacle_m
+        if min_depth >= soft_threshold:
+            return 0.0, False
 
         # Only penalise trajectories heading forward (positive x in base_link)
         endpoint = waypoints_base[-1]
@@ -783,10 +1034,20 @@ class TrajectorySelector:
             # Trajectory turns backward / sideways — not heading into obstacle
             return 0.0, False
 
-        # Scale by how far forward the trajectory extends
         forward_fraction = min(forward_component / self.horizon_m, 1.0)
-        cost = severity * forward_fraction * self.collision_penalty
-        has_collision = severity > 0.7 and forward_fraction > 0.3
+
+        if min_depth < self.depth_obstacle_m:
+            # Hard tier: depth below hard threshold — full collision
+            severity = 1.0 - min_depth / self.depth_obstacle_m
+            cost = severity * forward_fraction * self.collision_penalty
+            has_collision = severity > 0.5 and forward_fraction > 0.2
+        else:
+            # Soft tier: between depth_obstacle_m and 2*depth_obstacle_m
+            # Linear penalty, no hard collision flag
+            severity = 1.0 - (min_depth - self.depth_obstacle_m) / self.depth_obstacle_m
+            cost = severity * forward_fraction * self.collision_penalty * 0.4
+            has_collision = False
+
         return cost, has_collision
 
     def _direction_reward(
@@ -814,6 +1075,39 @@ class TrajectorySelector:
             return max(0.0, -ny)  # -y = right in base_link
         else:  # centre
             return max(0.0, nx)   # +x = forward in base_link
+
+    def _frontier_direction_reward(
+        self,
+        waypoints_world: np.ndarray,
+        frontier_direction: tuple[float, float],
+    ) -> float:
+        """Reward trajectories whose endpoint heads toward the frontier direction.
+
+        ``frontier_direction`` is a unit vector in world frame pointing from
+        the robot toward the nearest frontier centroid.  The reward is the
+        cosine similarity between that vector and the trajectory's
+        displacement vector (start → endpoint in world frame), mapped to
+        ``[0, 1]``.
+
+        Returns 1.0 when perfectly aligned, 0.0 when orthogonal or opposing.
+        """
+        indices = self._horizon_indices(waypoints_world)
+        if len(indices) < 2:
+            return 0.5  # neutral
+
+        start = waypoints_world[indices[0]]
+        end = waypoints_world[indices[-1]]
+        traj_vec = end - start
+        traj_len = math.sqrt(traj_vec[0] ** 2 + traj_vec[1] ** 2)
+        if traj_len < 1e-6:
+            return 0.5
+
+        # Normalise
+        tx, ty = traj_vec[0] / traj_len, traj_vec[1] / traj_len
+        fx, fy = frontier_direction
+        # Cosine similarity → [-1, 1] → map to [0, 1]
+        cos_sim = tx * fx + ty * fy
+        return max(0.0, (cos_sim + 1.0) / 2.0)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -924,8 +1218,8 @@ class TrajectorySelector:
 
         return max_cost
 
-    @staticmethod
     def _extract_obstacles_near_trajectory(
+        self,
         costmap: OccupancyGrid,
         waypoints_world: np.ndarray,
         radius: float,
@@ -955,7 +1249,12 @@ class TrajectorySelector:
 
         # Extract occupied cells in the region
         patch = costmap.grid[gy_min:gy_max + 1, gx_min:gx_max + 1]
-        occ_ys, occ_xs = np.where(patch >= CostValues.OCCUPIED)
+        # Use the selector's configured cost_threshold (typ. 50) rather than
+        # CostValues.OCCUPIED (=100).  Gradient-based costmaps
+        # (height_cost_occupancy) emit graded values in [0,100]; most wall
+        # cells land in 50–99, so requiring ==100 silently drops them and
+        # Frenet corridor checks never see the walls.
+        occ_ys, occ_xs = np.where(patch >= self.cost_threshold)
 
         if len(occ_ys) == 0:
             return np.zeros((0, 2), dtype=np.float32)

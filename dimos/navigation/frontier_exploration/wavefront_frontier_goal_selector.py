@@ -89,6 +89,12 @@ class WavefrontConfig(ModuleConfig):
     info_gain_threshold: float = 0.03
     num_no_gain_attempts: int = 2
     goal_timeout: float = 15.0
+    # Room-exit mode corridor scoring
+    corridor_optimal_dist_m: float = 0.7
+    """Obstacle distance (metres) that scores highest in corridor scoring.
+    Doorways and corridors typically have obstacles ~0.7 m away on each side."""
+    corridor_sigma_m: float = 0.3
+    """Gaussian sigma for corridor scoring; wider = less discriminating."""
 
 
 class WavefrontFrontierExplorer(Module[WavefrontConfig]):
@@ -139,6 +145,13 @@ class WavefrontFrontierExplorer(Module[WavefrontConfig]):
         # Latest data
         self.latest_costmap: OccupancyGrid | None = None
         self.latest_odometry: PoseStamped | None = None
+
+        # Cached frontiers for external consumers (e.g. FrontierOverlayModule).
+        # Updated every time detect_frontiers() completes.
+        self.last_ranked_frontiers: list[Vector3] = []
+        """Last set of ranked frontier centroids in **world frame** (x, y, z=0)."""
+        self.last_selected_goal: Vector3 | None = None
+        """The goal selected in the most recent ``select_frontier_goal`` call."""
 
         # Goal reached event
         self.goal_reached_event = threading.Event()
@@ -514,6 +527,94 @@ class WavefrontFrontierExplorer(Module[WavefrontConfig]):
         # This indicates the frontier is safely away from obstacles
         return min_distance if min_distance != float("inf") else self.config.safe_distance
 
+    def _compute_corridor_score(self, frontier: Vector3, costmap: OccupancyGrid) -> float:
+        """Score how likely a frontier is at a doorway or corridor entrance.
+
+        Uses a Gaussian peaked at ``corridor_optimal_dist_m`` (default 0.7 m)
+        away from the nearest obstacle.  Doorways and corridors typically have
+        walls ~0.4–1.0 m away; open room interiors have obstacles much farther
+        away or none within the search radius.
+
+        Args:
+            frontier: Frontier point in world coordinates.
+            costmap: Current costmap.
+
+        Returns:
+            Score in [0, 1]; higher = more corridor/doorway-like.
+        """
+        import math
+
+        dist = self._compute_distance_to_obstacles(frontier, costmap)
+        optimal = self.config.corridor_optimal_dist_m
+        sigma = self.config.corridor_sigma_m
+        return math.exp(-0.5 * ((dist - optimal) / sigma) ** 2)
+
+    def _compute_comprehensive_frontier_score_room_exit(
+        self, frontier: Vector3, frontier_size: int, robot_pose: Vector3, costmap: OccupancyGrid
+    ) -> float:
+        """Compute frontier score optimised for room-exit navigation.
+
+        Replaces the direction-momentum term with a corridor score so that
+        doorway-shaped frontiers are strongly preferred over open-wall frontiers
+        during ROOM_EXIT mode.
+
+        Score weights (sum to 1.0):
+            0.25  information gain (frontier size)
+            0.25  corridor score   (narrow passage detection)
+            0.20  explored goals   (distance from already-visited goals)
+            0.15  distance         (moderate distance from robot)
+            0.15  obstacle safety  (not too close to walls)
+
+        Args:
+            frontier: Frontier centroid in world coordinates.
+            frontier_size: Number of frontier cells (proxy for information gain).
+            robot_pose: Current robot position in world coordinates.
+            costmap: Current occupancy grid.
+
+        Returns:
+            Total score in [0, 1].
+        """
+        # 1. Distance score
+        robot_distance = np.sqrt(
+            (frontier.x - robot_pose.x) ** 2 + (frontier.y - robot_pose.y) ** 2
+        )
+        distance_score = 1.0 / (1.0 + abs(robot_distance - self.config.lookahead_distance))
+
+        # 2. Information gain
+        max_expected_frontier_size = self.config.min_frontier_perimeter / costmap.resolution * 10
+        info_gain_score = min(frontier_size / max_expected_frontier_size, 1.0)
+
+        # 3. Distance from explored goals
+        explored_goals_distance = self._compute_distance_to_explored_goals(frontier)
+        explored_goals_score = min(explored_goals_distance / self.config.max_explored_distance, 1.0)
+
+        # 4. Obstacle safety
+        obstacles_distance = self._compute_distance_to_obstacles(frontier, costmap)
+        if obstacles_distance >= self.config.safe_distance:
+            obstacles_score = 1.0
+        else:
+            obstacles_score = obstacles_distance / self.config.safe_distance
+
+        # 5. Corridor score (replaces momentum in room-exit mode)
+        corridor_score = self._compute_corridor_score(frontier, costmap)
+
+        total_score = (
+            0.25 * info_gain_score
+            + 0.25 * corridor_score
+            + 0.20 * explored_goals_score
+            + 0.15 * distance_score
+            + 0.15 * obstacles_score
+        )
+
+        logger.info(
+            "RoomExit frontier score: info_gain=%.2f, corridor=%.2f, "
+            "explored=%.2f, dist=%.2f, obstacles=%.2f → total=%.2f",
+            info_gain_score, corridor_score, explored_goals_score,
+            distance_score, obstacles_score, total_score,
+        )
+
+        return total_score
+
     def _compute_comprehensive_frontier_score(
         self, frontier: Vector3, frontier_size: int, robot_pose: Vector3, costmap: OccupancyGrid
     ) -> float:
@@ -646,10 +747,12 @@ class WavefrontFrontierExplorer(Module[WavefrontConfig]):
         # Always detect new frontiers to get most up-to-date information
         # The new algorithm filters out explored areas and returns only the best frontier
         frontiers = self.detect_frontiers(robot_pose, costmap)
+        self.last_ranked_frontiers = list(frontiers)
 
         if not frontiers:
             # Store current costmap before returning
             self.last_costmap = costmap  # type: ignore[assignment]
+            self.last_selected_goal = None
             self.reset_exploration_session()
             return None
 
@@ -659,6 +762,7 @@ class WavefrontFrontierExplorer(Module[WavefrontConfig]):
 
             # Store the selected goal as explored
             selected_goal = frontiers[0]
+            self.last_selected_goal = selected_goal
             self.mark_explored_goal(selected_goal)
 
             # Store current costmap for next comparison
@@ -670,6 +774,75 @@ class WavefrontFrontierExplorer(Module[WavefrontConfig]):
         self.last_costmap = costmap  # type: ignore[assignment]
         return None
 
+    @rpc
+    def get_frontier_points(self) -> list[dict[str, float]]:
+        """Return all cached frontier centroids and the selected goal.
+
+        Returns:
+            List of dicts with keys ``x``, ``y``, ``selected`` (bool).
+            The first entry (if any) with ``selected=True`` is the current goal.
+        """
+        result: list[dict[str, float]] = []
+        selected = self.last_selected_goal
+        for f in self.last_ranked_frontiers:
+            is_sel = (
+                selected is not None
+                and abs(f.x - selected.x) < 0.01
+                and abs(f.y - selected.y) < 0.01
+            )
+            result.append({"x": f.x, "y": f.y, "selected": float(is_sel)})
+        return result
+
+    @rpc
+    def get_frontiers_room_exit(self, top_k: int = 5) -> list[tuple[Vector3, float]]:
+        """Return top-K frontiers ranked by the room-exit scoring function.
+
+        Uses the module's internal latest costmap and odometry.  Unlike
+        ``get_exploration_goal`` (which applies info-gain gating and returns at
+        most one goal), this @rpc always returns up to ``top_k`` candidates with
+        their scores so the caller (e.g. VLMFrontierJudge in vln_skill.py) can
+        further rank them using semantic reasoning.
+
+        This is intended for use in ROOM_EXIT mode only.  It bypasses the
+        info-gain threshold check because the robot is already known to be in a
+        saturated room.
+
+        Note: frontier sizes are not available from ``detect_frontiers``
+        (which returns pre-ranked centroids only), so a nominal size of 10 cells
+        is used uniformly — this is acceptable because the corridor and
+        explored-goals terms dominate the room-exit score.
+
+        Args:
+            top_k: Maximum number of frontier candidates to return.
+
+        Returns:
+            List of (frontier_world_pos, score) tuples, sorted descending by
+            room-exit score.  Empty list if the costmap/odometry is not yet
+            available or if no frontiers are detected.
+        """
+        if self.latest_costmap is None or self.latest_odometry is None:
+            logger.info("get_frontiers_room_exit: costmap or odometry not yet available")
+            return []
+
+        costmap = simple_inflate(self.latest_costmap, 0.25)
+        robot_pose = self.latest_odometry.position
+
+        frontier_centroids = self.detect_frontiers(robot_pose, costmap)
+        if not frontier_centroids:
+            return []
+
+        nominal_size = 10  # used uniformly — corridor score is the key term
+        scored: list[tuple[Vector3, float]] = []
+        for frontier in frontier_centroids:
+            score = self._compute_comprehensive_frontier_score_room_exit(
+                frontier, nominal_size, robot_pose, costmap
+            )
+            scored.append((frontier, score))
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return scored[:top_k]
+
+    @rpc
     def mark_explored_goal(self, goal: Vector3) -> None:
         """Mark a goal as explored."""
         self.explored_goals.append(goal)
@@ -688,6 +861,34 @@ class WavefrontFrontierExplorer(Module[WavefrontConfig]):
         self._cache.clear()  # Clear frontier point cache
 
         logger.info("Exploration session reset - all state variables cleared")
+
+    @rpc
+    def get_best_frontier_goal(self) -> Vector3 | None:
+        """Return the single best frontier exploration goal using the module's internal state.
+
+        Uses the latest received costmap and odometry so it can be called from external
+        modules (e.g. VLNSkillContainer hybrid mode) without passing costmap over RPC.
+
+        Returns the best frontier as a Vector3 in world coordinates, or None if no
+        frontier is reachable or costmap/odometry is not yet available.
+        """
+        if self.latest_costmap is None or self.latest_odometry is None:
+            return None
+
+        costmap = simple_inflate(self.latest_costmap, 0.25)
+        robot_pose = Vector3(
+            self.latest_odometry.position.x, self.latest_odometry.position.y, 0.0
+        )
+        return self.get_exploration_goal(robot_pose, costmap)
+
+    @rpc
+    def get_latest_costmap(self) -> OccupancyGrid | None:
+        """Return the most recently received costmap, or None if not yet available.
+
+        Used by VLMFrontierJudge to render the top-down occupancy map for the
+        Qwen3-VL-8B frontier selection prompt.
+        """
+        return self.latest_costmap
 
     @rpc
     def explore(self) -> bool:

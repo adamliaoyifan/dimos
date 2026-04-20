@@ -383,6 +383,44 @@ class GlobalPlanner(Resource):
 
         return safe_goal
 
+    def compute_path_to_goal(self, goal: PoseStamped) -> Path | None:
+        """Compute an A* path to goal and return it without driving.
+
+        Unlike ``handle_goal_request``, this does NOT start the local planner
+        or publish cmd_vel.  It is a pure path-query used by hybrid exploration
+        so NavDP can receive the global path as a guidance signal without
+        ceding velocity control to the A* local planner.
+
+        Returns the resampled ``Path`` on success, or ``None`` if no path was
+        found (goal unreachable / no costmap).
+        """
+        with self._lock:
+            current_odom = self._current_odom
+
+        if current_odom is None:
+            logger.warning("compute_path_to_goal: missing odometry, cannot plan.")
+            return None
+
+        safe_goal = self._find_safe_goal(goal.position)
+        if safe_goal is None:
+            logger.warning(
+                "compute_path_to_goal: no safe goal found near (%.2f, %.2f).",
+                goal.position.x,
+                goal.position.y,
+            )
+            return None
+
+        path = self._find_wide_path(safe_goal, current_odom.position)
+        if not path:
+            logger.warning(
+                "compute_path_to_goal: no A* path to (%.2f, %.2f).",
+                safe_goal.x,
+                safe_goal.y,
+            )
+            return None
+
+        return smooth_resample_path(path, goal, 0.1)
+
     def _reset_safe_goal_clearance(self) -> None:
         with self._lock:
             self._safe_goal_clearance = self._global_config.robot_rotation_diameter / 2
