@@ -28,10 +28,19 @@ search:
   search_progress_distance: 1.0     # metres of new trail needed per stall window to count as progress
   search_observed_fraction: 0.85    # if costmap observed fraction exceeds this → boundary fully explored → stop
   approach_timeout: 30.0
-  similarity_threshold: 0.23
-  # Exploration backend: "astar" (WavefrontFrontier + A*) or "navdp" (diffusion-policy nogoal).
-  # Use "navdp" to test NavDP server trajectory generation in isolation.
-  exploration_mode: navdp #astar
+  similarity_threshold: 0.35        # raised from 0.23 — reduces noisy CLIP self-matches
+  semantic_near_pose_threshold: 0.5 # reject memory hits within 0.5m of current pose
+  # Exploration backend:
+  #   "astar"  — WavefrontFrontier + A* path follower (no NavDP)
+  #   "navdp"  — NavDP diffusion-policy nogoal (no global plan)
+  #   "hybrid" — NavDP local obstacle avoidance + A* global path guidance
+  exploration_mode: hybrid
+  # hybrid mode: use Qwen3-VL-8B to rank frontier candidates before selecting goal
+  frontier_vlm_enabled: true
+  # hybrid mode: re-run VLM frontier ranking every N frontier selections
+  frontier_vlm_interval: 5
+  # hybrid mode: recompute A* guidance path after this many metres of travel
+  frontier_replan_distance_m: 3.0
   # Detection confirmation tuning
   confirm_checks: 3         # VLM queries for confirmation
   confirm_threshold: 2      # required positives out of confirm_checks
@@ -52,6 +61,9 @@ search:
   approach_stop_distance: 0.6       # stop this many metres from estimated object centre
   approach_min_depth_confidence: 0.3  # min valid-pixel ratio to trust depth estimate
   approach_ema_alpha: 0.3            # EMA alpha for filtering 3D target position
+
+  # Memory-guided search
+  use_memory: false
 
 # ── NavDP (diffusion-policy navigation) ────────────────────────────
 # Set enabled: true if NavDP inference server is running
@@ -113,9 +125,9 @@ navdp:
         - [614.0, 0.0, 320.0]
         - [0.0, 614.0, 240.0]
         - [0.0, 0.0, 1.0]
-      x: 0.15
+      x: -0.20
       y: 0.00
-      z: 0.28
+      z: 0.30
       pitch: 0.10
       width: 640
       height: 480
@@ -152,7 +164,7 @@ navdp:
         - [382.0, 0.0, 320.0]
         - [0.0,  382.0, 240.0]
         - [0.0,   0.0,   1.0]
-      x: 0.15
+      x: -0.20
       y: 0.00
       z: 0.30
       pitch: 0.10
@@ -163,24 +175,24 @@ navdp:
     # Same RealSense geometry as realsense_d435; images arrive via LCM from
     # ``ros2_dimos_lcm_bridge`` (see ros2_dimos_lcm_bridge/README.md).
     realsense_lcm:
-      intrinsic:
-        - [614.0, 0.0, 320.0]
-        - [0.0, 614.0, 240.0]
-        - [0.0, 0.0, 1.0]
-      x: 0.15
+      # intrinsic/width/height are null — live values come from camera_info via the bridge.
+      # Set these only if you want to override the live CameraInfo from the camera.
+      intrinsic: null
+      width: null
+      height: null
+      x: -0.15
       y: 0.00
-      z: 0.28
+      z: 0.23
       pitch: 0.10
-      width: 640
-      height: 480
       fps: 30
       lcm_rgb_basename: /dimos/realsense/rgb
       lcm_depth_basename: /dimos/realsense/depth
+      lcm_camera_info_basename: /dimos/realsense/camera_info
 
   # Graceful network-failure: hold last velocity then decelerate to zero.
   # Trajectories are in local frame — they CANNOT be replayed after the
   # robot moves, so we hold/decel rather than replaying stale data.
-  hold_duration_s: 0.3   # hold last (v,w) for this many seconds
+  hold_duration_s: 0.0   # hold last (v,w) for this many seconds
   decel_duration_s: 0.5  # then decelerate linearly to zero over this window
 
   # VLM control: set false in VLN deployments so VLNSkillContainer owns all
@@ -189,8 +201,8 @@ navdp:
 
   # Trajectory controller tuning (matched to bridge defaults)
   mpc_horizon: 15
-  mpc_desired_v: 0.2
-  mpc_v_max: 0.3
+  mpc_desired_v: 0.3
+  mpc_v_max: 0.4
   mpc_w_max: 0.2
   mpc_ref_gap: 3
   goal_lookahead_m: 1.0
@@ -203,15 +215,17 @@ navdp:
     enabled: true
     cost_threshold: 50       # cells >= this are lethal (matches A*)
     unknown_penalty: 0.8      # fraction of cost_threshold for unknown cells
-    critic_weight: 0.2        # reward weight for NavDP critic score
+    critic_weight: 0.8        # reward weight for NavDP critic score
     costmap_weight: 0.8       # multiplier for accumulated costmap cost
     collision_penalty: 1000.0 # flat penalty per lethal cell hit
     robot_length: 0.6         # full length of robot front-to-rear (metres)
     robot_half_width: 0.15    # half the width of robot side-to-side (metres)
     robot_radius: 0.30        # circumscribing radius for LiDAR fallback (metres)
     horizon_m: 1.5            # only check waypoints within this distance
-    sample_step: 2            # evaluate every N-th waypoint
+    sample_step: 1            # evaluate every N-th waypoint
     max_trajectory_cost: 50.0 # reject trajectories above this combined cost (null = disabled)
+    min_trajectory_length: 0.3 # reject trajectories whose total path length is below this (m) — prevents "freeze in front of wall"
+    critic_min_accept: -5.0    # if best survivor's critic is below this, treat as stall (NavDP critic ~= -10 means "unsafe") and trigger escape
     explore_weight: 5.0       # multiplier for exploration cost (only active during SEEK)
     explore_radius: 2.0       # metres; penalty decays to zero at this distance from explored path
     explore_endpoint_bonus: 1.0  # bonus weight for trajectory endpoints heading into novel territory
@@ -220,6 +234,7 @@ navdp:
     open_space_radius: 0.6       # metres; box half-width for counting nearby FREE cells (0=off)
     depth_obstacle_m: 0.5        # metres; depth below this in centre of image → penalise forward trajectories (0=off)
     direction_weight: 3.0        # reward weight for trajectories heading toward the VLM-detected object direction (left/centre/right)
+    frontier_weight: 5.0         # reward weight for trajectories heading toward nearest frontier (free/unknown boundary); helps escape dead ends
 
 # ── Escape / stuck recovery ───────────────────────────────────────
 escape:
@@ -229,6 +244,74 @@ escape:
   escape_backup_distance: 0.3
   escape_rotate_degrees: 90.0
   max_escape_attempts: 4
+
+# ── Room exit (memory-augmented frontier room exit) ──────────────────
+# Triggered when the robot saturates the current room during active_search.
+# Instead of returning failure, the robot backtracks along the entry trail,
+# uses Qwen3-VL-8B to rank exit frontiers semantically, and re-enters the
+# search loop in an adjacent room.  Set enabled: true to activate.
+room_exit:
+  enabled: false               # set to true to enable room-exit mode
+
+  max_exit_depth: 2            # max recursive room-exit attempts
+
+  # VLM frontier judge (Qwen3-VL-8B)
+  vlm_judge_enabled: true      # use VLM to rank candidate exit frontiers
+  vlm_judge_top_k: 5           # top-K geometric frontiers shown to VLM
+  vlm_judge_weight: 0.4        # VLM blend weight (1 - this = geometric)
+  vlm_judge_timeout_s: 8.0     # fallback to uniform if VLM takes too long
+
+  # Trail backtrack
+  trail_sample_spacing_m: 1.0  # thin trail to approx this interval
+  backtrack_novelty_threshold: 0.6  # stop backtracking when novelty >= this
+  memory_query_radius_m: 1.5   # SpatialMemory query radius per waypoint
+
+  # Anti-re-entry
+  searched_area_radius_m: 2.0  # exclusion radius around searched locations
+
+  # Navigation
+  nav_timeout_s: 45.0          # timeout for A* navigation to backtrack/exit wp
+
+# ── Multi-room search (two-phase: room discovery → object search) ────
+# Enables semantic room targeting for multi-room environments (houses, offices
+# with separate rooms).  When enabled, the robot first reasons about which room
+# type is most likely to contain the target object, then explores to find that
+# room before starting the object search loop.
+# Set enabled: false for single-room scenes (office1) — preserves legacy
+# behaviour where the robot searches the whole floor immediately.
+multi_room:
+  enabled: false               # set true for multi-room scenes (house, office suite)
+
+  # Room identification frequency
+  room_check_interval_m: 2.5  # move this far before re-querying VLM for room type
+
+  # Discovery limits
+  max_rooms_to_search: 6       # give up after this many distinct rooms searched
+  room_discovery_timeout_s: 300.0
+
+  # Hardcoded fallback: object keyword → list of likely room types
+  # Used when the VLM text call fails or returns ambiguous results.
+  object_room_map:
+    book case: [study room, office, library]
+    bookcase: [study room, office, library]
+    bookshelf: [study room, office, library]
+    desk: [study room, office, bedroom]
+    computer: [study room, office]
+    refrigerator: [kitchen]
+    fridge: [kitchen]
+    stove: [kitchen]
+    oven: [kitchen]
+    sink: [kitchen, bathroom]
+    toilet: [bathroom]
+    bathtub: [bathroom]
+    shower: [bathroom]
+    sofa: [living room]
+    couch: [living room]
+    television: [living room, bedroom]
+    tv: [living room, bedroom]
+    bed: [bedroom]
+    wardrobe: [bedroom]
+    dining table: [dining room, kitchen]
 
 # ── Blueprint options ────────────────────────────────────────────────
 blueprint:

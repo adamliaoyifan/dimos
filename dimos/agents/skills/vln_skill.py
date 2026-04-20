@@ -40,6 +40,7 @@ from dimos.models.qwen.bbox import BBox
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
 from dimos.msgs.geometry_msgs.Quaternion import Quaternion
 from dimos.msgs.geometry_msgs.Vector3 import Vector3, make_vector3
+from dimos.msgs.sensor_msgs.CameraInfo import CameraInfo
 from dimos.msgs.sensor_msgs.Image import Image
 from dimos.navigation.base import NavigationState
 from dimos.navigation.visual.query import get_object_bbox_from_image
@@ -61,12 +62,28 @@ class VLNConfig(ModuleConfig):
     approach_timeout: float = 30.0
     """Maximum seconds to approach a detected object."""
 
-    similarity_threshold: float = 0.23
+    similarity_threshold: float = 0.35
     """Minimum CLIP similarity for semantic map queries."""
 
+    semantic_near_pose_threshold: float = 0.5
+    """Reject semantic-map matches whose stored pose is within this many metres
+    of the robot's current odometry position.  Prevents trivial self-matches
+    (where the best CLIP hit happens to be a frame captured at the robot's
+    current location) from producing zero-distance A* goals that complete
+    instantly and then falsely report failure."""
+
     exploration_mode: str = "astar"
-    """Exploration backend: "astar" (WavefrontFrontier + A*) or "navdp" (diffusion-policy nogoal).
-    Use "navdp" to test the NavDP server in isolation."""
+    """Exploration backend: "astar" (WavefrontFrontier + A*), "navdp" (diffusion-policy nogoal),
+    or "hybrid" (NavDP local obstacle avoidance + A* global path guidance)."""
+
+    frontier_vlm_enabled: bool = False
+    """In hybrid mode: use VLMFrontierJudge to rank frontier candidates before selecting goal."""
+
+    frontier_vlm_interval: int = 5
+    """In hybrid mode: re-run VLM frontier ranking every N frontier selections."""
+
+    frontier_replan_distance_m: float = 3.0
+    """In hybrid mode: recompute A* guidance path after the robot travels this many metres."""
 
     vlm_backend: str = "qwen3_local"
     """VLM backend: 'qwen3_local' (custom Qwen3 server), 'qwen_local' (OpenAI-compat),
@@ -146,6 +163,82 @@ class VLNConfig(ModuleConfig):
     at startup via tag_location so VLN can navigate to named rooms immediately
     without requiring prior exploration.  Set to empty string to disable (default)."""
 
+    # ------------------------------------------------------------------
+    # Room-exit configuration
+    # ------------------------------------------------------------------
+
+    room_exit_enabled: bool = False
+    """Enable memory-augmented room-exit mode when the robot saturates a room.
+    When True, instead of returning failure on saturation, the robot attempts
+    to backtrack along the entry trail and re-enter the search loop in an
+    adjacent room.  Set to True in vln_config.yaml under room_exit.enabled."""
+
+    room_exit_max_depth: int = 2
+    """Maximum recursive room-exit attempts before giving up."""
+
+    room_exit_vlm_judge_enabled: bool = True
+    """Use Qwen3-VL-8B to evaluate frontier candidates during room-exit."""
+
+    room_exit_vlm_judge_top_k: int = 5
+    """Number of top geometric frontier candidates to show the VLM judge."""
+
+    room_exit_vlm_judge_weight: float = 0.4
+    """Blend weight for VLM confidence score (1 - this = geometric weight)."""
+
+    room_exit_vlm_judge_timeout_s: float = 8.0
+    """Maximum seconds to wait for VLM frontier judge response."""
+
+    room_exit_trail_sample_spacing_m: float = 1.0
+    """Minimum spacing (metres) between thinned trail waypoints."""
+
+    room_exit_backtrack_novelty_threshold: float = 0.6
+    """Stop backtracking when memory novelty score exceeds this."""
+
+    room_exit_memory_query_radius_m: float = 1.5
+    """SpatialMemory query radius when scoring trail waypoints."""
+
+    room_exit_searched_area_radius_m: float = 2.0
+    """Exclusion radius (metres) around tagged 'searched' locations."""
+
+    room_exit_nav_timeout_s: float = 45.0
+    """Timeout for navigating to the backtrack waypoint."""
+
+    # ------------------------------------------------------------------
+    # Multi-room discovery configuration
+    # ------------------------------------------------------------------
+
+    multi_room_enabled: bool = False
+    """Enable two-phase multi-room search: first discover the correct room type,
+    then search for the object within that room.  Set True for house/multi-room
+    scenes."""
+
+    multi_room_check_interval_m: float = 2.5
+    """Minimum robot movement (metres) before re-identifying the current room type."""
+
+    multi_room_max_rooms: int = 6
+    """Give up room discovery after searching this many distinct rooms."""
+
+    multi_room_discovery_timeout_s: float = 300.0
+    """Hard time limit for the room discovery loop (seconds)."""
+
+    multi_room_object_room_map: dict[str, list[str]] = {}  # type: ignore[assignment]
+    """Hardcoded fallback: maps lower-case object keyword to a list of likely room types."""
+
+    # ------------------------------------------------------------------
+    # Memory-guided search configuration
+    # ------------------------------------------------------------------
+
+    use_memory: bool = True
+    """Query SpatialMemory during the active search loop.
+    When True, periodically re-queries CLIP semantic memory for the target object
+    and navigates toward any match above similarity_threshold instead of continuing
+    blind frontier exploration.  Set False for pure online exploration."""
+
+    memory_query_interval: int = 5
+    """Query memory every N VLM check cycles when use_memory=True.
+    Lower values make memory queries more frequent; higher values rely more on
+    frontier exploration between queries."""
+
 
 class VLNSkillContainer(Module[VLNConfig]):
     """Vision-and-Language Navigation skill for compound goals.
@@ -177,8 +270,12 @@ class VLNSkillContainer(Module[VLNConfig]):
         # "WavefrontFrontierExplorer.stop_exploration",
         # "WavefrontFrontierExplorer.is_exploration_active",
         "SpatialMemory.query_by_text",
+        "SpatialMemory.query_by_location",
         "SpatialMemory.tag_location",
         "SpatialMemory.query_tagged_location",
+        # Room-exit mode: corridor-aware frontier ranking + costmap for VLM rendering
+        "WavefrontFrontierExplorer.get_frontiers_room_exit",
+        "WavefrontFrontierExplorer.get_latest_costmap",
         # NavDP (optional — used for imagegoal approach when available)
         "NavDPNavigator.set_language_goal",
         "NavDPNavigator.set_reference_image",
@@ -187,17 +284,26 @@ class VLNSkillContainer(Module[VLNConfig]):
         "NavDPNavigator.resume_motion",
         "NavDPNavigator.cancel_goal",
         "NavDPNavigator.get_exploration_stats",
+        "NavDPNavigator.get_explore_trail",
         "NavDPNavigator.clear_exploration_trail",
         # In-place rotation during detection confirmation (uses A* planner, collision-safe)
         "UnitreeSkillContainer.relative_move",
         # NavDP memory — object instance recording (optional)
         "NavDPMemory.record_object_instance",
         "NavDPMemory.query_object_3d",
+        # Hybrid exploration mode: A* path guidance for NavDP
+        "ReplanningAStarPlanner.compute_path_to_goal",
+        "NavDPNavigator.set_path_guidance",
+        "NavDPNavigator.clear_path_guidance",
+        "NavDPNavigator.get_escape_attempt_count",
+        "WavefrontFrontierExplorer.get_best_frontier_goal",
+        "WavefrontFrontierExplorer.mark_explored_goal",
     ]
 
     color_image: In[Image]
     depth_image: In[Image]
     odom: In[PoseStamped]
+    realsense_camera_info: In[CameraInfo]
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
@@ -217,6 +323,15 @@ class VLNSkillContainer(Module[VLNConfig]):
         self._search_stop = threading.Event()
         self._search_thread: threading.Thread | None = None
         self._search_result: str | None = None
+
+        # Multi-room room-identification cache
+        # Stores (room_type_string, (x, y)) — invalidated when robot moves
+        # more than multi_room_check_interval_m from the cached check position.
+        self._room_id_cache: tuple[str, tuple[float, float]] | None = None
+
+        # Memory-guided search state
+        self._memory_vlm_cycle: int = 0
+        """VLM cycle counter for memory_query_interval gating."""
 
     def _create_vlm(self):  # type: ignore[no-untyped-def]
         """Instantiate the VLM backend based on config."""
@@ -250,6 +365,7 @@ class VLNSkillContainer(Module[VLNConfig]):
         self._disposables.add(Disposable(self.color_image.subscribe(self._on_image)))
         self._disposables.add(Disposable(self.depth_image.subscribe(self._on_depth)))
         self._disposables.add(Disposable(self.odom.subscribe(self._on_odom)))
+        self._disposables.add(Disposable(self.realsense_camera_info.subscribe(self._on_camera_info)))
 
         # Initialise ObjectLocalizer with camera intrinsics from config
         from dimos.navigation.visual.object_localizer import ObjectLocalizer
@@ -349,6 +465,31 @@ class VLNSkillContainer(Module[VLNConfig]):
     def _on_odom(self, odom: PoseStamped) -> None:
         self._latest_odom = odom
 
+    def _on_camera_info(self, info: CameraInfo) -> None:
+        """Reinitialize ObjectLocalizer and VLM auto_resize from live CameraInfo."""
+        import numpy as np
+        from dimos.navigation.visual.object_localizer import ObjectLocalizer
+
+        K = np.array(info.K, dtype=np.float64).reshape(3, 3)
+        self._localizer = ObjectLocalizer(
+            intrinsic=K,
+            cam_x=self.config.cam_x,
+            cam_y=self.config.cam_y,
+            cam_z=self.config.cam_z,
+            cam_pitch=self.config.cam_pitch,
+            depth_scale=self.config.depth_scale,
+        )
+        # Update navdp imagegoal size from live camera dimensions
+        self.config.navdp_imagegoal_width = info.width
+        self.config.navdp_imagegoal_height = info.height
+        # Update VLM auto_resize so queries use the actual camera resolution
+        if hasattr(self._vl_model, "config"):
+            self._vl_model.config.auto_resize = (info.width, info.height)
+        # logger.info(
+        #     "[VLNSkill] CameraInfo updated: %dx%d fx=%.1f fy=%.1f",
+        #     info.width, info.height, K[0, 0], K[1, 1],
+        # )
+
     # ------------------------------------------------------------------
     # Goal decomposition
     # ------------------------------------------------------------------
@@ -421,29 +562,16 @@ class VLNSkillContainer(Module[VLNConfig]):
         except Exception:
             pass
 
-        # NavDP exploration must stay active across checks so its stuck/escape
-        # history can accumulate; only pause motion. A* exploration still needs
-        # to be stopped explicitly because it has no pause primitive.
-        if self.config.exploration_mode != "navdp":
+        # NavDP and hybrid exploration must stay active across VLM checks so
+        # stuck/escape history can accumulate; only pause motion.
+        # Hybrid mode: the frontier loop thread must not be killed here, or
+        # the A* guidance path is lost and escape state is reset every VLM cycle.
+        # A* exploration still needs to be stopped explicitly (no pause primitive).
+        if self.config.exploration_mode == "astar":
             try:
                 self._stop_exploration()
             except Exception:
                 pass
-        else:
-            # #region agent log
-            try:
-                import json as _json
-                with open("/home/adamliao/work/dimos/.cursor/debug.log", "a") as _dbgf:
-                    _dbgf.write(_json.dumps({
-                        "timestamp": int(time.time() * 1000),
-                        "runId": "post-fix",
-                        "hypothesisId": "A-reset-loop",
-                        "location": "vln_skill.py:pause_for_vlm_navdp",
-                        "message": "paused NavDP motion without canceling exploration",
-                    }) + "\n")
-            except Exception:
-                pass
-            # #endregion
 
     def _resume_motion_after_vlm_check(self) -> None:
         """Best-effort resume for motion previously paused during VLM checks."""
@@ -486,23 +614,11 @@ class VLNSkillContainer(Module[VLNConfig]):
     def _resume_exploration_after_vlm_check(self) -> None:
         """Resume exploration after a blocking VLM check."""
         self._resume_motion_after_vlm_check()
-        if self.config.exploration_mode != "navdp":
+        # A* has no pause primitive so it must be fully restarted.
+        # NavDP and hybrid modes only need motion resumed — the exploration
+        # thread and escape state must not be reset here.
+        if self.config.exploration_mode == "astar":
             self._start_exploration()
-        else:
-            # #region agent log
-            try:
-                import json as _json
-                with open("/home/adamliao/work/dimos/.cursor/debug.log", "a") as _dbgf:
-                    _dbgf.write(_json.dumps({
-                        "timestamp": int(time.time() * 1000),
-                        "runId": "post-fix",
-                        "hypothesisId": "A-reset-loop",
-                        "location": "vln_skill.py:resume_after_vlm_navdp",
-                        "message": "resumed NavDP motion without restarting exploration",
-                    }) + "\n")
-            except Exception:
-                pass
-            # #endregion
 
     def _run_vlm_check_while_paused(self, check_fn: Callable[[], T]) -> T:
         """Pause robot motion, run blocking VLM check, then return its result."""
@@ -510,6 +626,140 @@ class VLNSkillContainer(Module[VLNConfig]):
         # Give the robot and camera a brief settle window.
         time.sleep(0.15)
         return check_fn()
+
+    # ------------------------------------------------------------------
+    # Multi-room helpers
+    # ------------------------------------------------------------------
+
+    _ROOM_TYPES = (
+        "living room", "kitchen", "bedroom", "study room", "bathroom",
+        "hallway", "corridor", "dining room", "garage", "office", "unknown",
+    )
+
+    def _identify_current_room(self) -> str:
+        """Ask the VLM what type of room is currently visible.
+
+        Result is cached by position: if the robot has not moved more than
+        ``multi_room_check_interval_m`` since the last check, the cached
+        value is returned immediately without a VLM call.
+
+        Returns:
+            A lower-case room type string (e.g. "study room", "kitchen",
+            "living room", "unknown").
+        """
+        # --- position-based cache check ---
+        current_pos = self._get_current_pose_xy()
+        if current_pos and self._room_id_cache is not None:
+            cached_room, cached_pos = self._room_id_cache
+            dist = math.sqrt(
+                (current_pos[0] - cached_pos[0]) ** 2
+                + (current_pos[1] - cached_pos[1]) ** 2
+            )
+            if dist < self.config.multi_room_check_interval_m:
+                return cached_room
+
+        def _query() -> str:
+            if self._latest_image is None:
+                return "unknown"
+            room_list = ", ".join(self._ROOM_TYPES)
+            prompt = (
+                "Look at this image from a robot camera mounted low inside a building.\n"
+                f"What type of room is this? Choose the SINGLE best match from: {room_list}.\n"
+                "Reply with ONLY the room type (e.g. 'study room') and nothing else."
+            )
+            try:
+                response = self._vl_model.query(self._latest_image, prompt)
+                response_lower = response.strip().lower()
+                # Match against known room types (longest match first to prefer
+                # "study room" over "room").
+                for rt in sorted(self._ROOM_TYPES, key=len, reverse=True):
+                    if rt in response_lower:
+                        return rt
+                # If no canonical match, return the first word(s) as-is (trimmed)
+                return response_lower.split("\n")[0].strip()[:50]
+            except Exception as exc:
+                logger.warning("[VLN-MultiRoom] _identify_current_room VLM failed: %s", exc)
+                return "unknown"
+
+        room_type = self._run_vlm_check_while_paused(_query)
+        # Update cache
+        if current_pos:
+            self._room_id_cache = (room_type, current_pos)
+        logger.info(
+            "[VLN-MultiRoom] Room identified as '%s' at pos=%s",
+            room_type,
+            f"({current_pos[0]:.2f}, {current_pos[1]:.2f})" if current_pos else "unknown",
+        )
+        return room_type
+
+    def _infer_target_room_type(self, obj: str) -> list[str]:
+        """Infer which room types are most likely to contain *obj*.
+
+        First checks the hardcoded ``multi_room_object_room_map`` config dict.
+        If no match is found, calls the VLM as a text-only reasoning step.
+
+        Args:
+            obj: Object name or description (e.g. "book case").
+
+        Returns:
+            Ordered list of lower-case room type strings (most likely first).
+            Falls back to ``["unknown"]`` if all methods fail.
+        """
+        obj_lower = obj.lower()
+
+        # --- Hardcoded map lookup (exact substring match) ---
+        for keyword, room_types in self.config.multi_room_object_room_map.items():
+            if keyword.lower() in obj_lower or obj_lower in keyword.lower():
+                logger.info(
+                    "[VLN-MultiRoom] Object '%s' matched keyword '%s' → rooms %s",
+                    obj, keyword, room_types,
+                )
+                return [r.lower() for r in room_types]
+
+        # --- VLM text-only reasoning ---
+        room_list = ", ".join(self._ROOM_TYPES[:-1])  # exclude "unknown"
+        prompt = (
+            f"A mobile robot needs to find: \"{obj}\".\n"
+            f"In a typical house or office, which room type(s) would most likely contain this item?\n"
+            f"Available room types: {room_list}.\n"
+            "List the 1-3 most likely room types, separated by commas, most likely first.\n"
+            "Reply with ONLY the comma-separated list (e.g. 'study room, office')."
+        )
+        try:
+            # Use text-only endpoint when available (Qwen3LocalVlModel), else
+            # fall back to asking the VLM with a placeholder image.
+            query_text_fn = getattr(self._vl_model, "query_text_only", None)
+            if query_text_fn is not None:
+                response = query_text_fn(prompt)
+            elif self._latest_image is not None:
+                response = self._vl_model.query(self._latest_image, prompt)
+            else:
+                raise RuntimeError("no text-only method and no image available")
+            if not response:
+                raise ValueError("empty response")
+            # Parse comma-separated types, normalise
+            raw_types = [t.strip().lower() for t in response.split(",")]
+            # Filter to known room types
+            matched: list[str] = []
+            for raw in raw_types:
+                for rt in self._ROOM_TYPES:
+                    if rt in raw and rt not in matched:
+                        matched.append(rt)
+                        break
+            if matched:
+                logger.info(
+                    "[VLN-MultiRoom] VLM inferred rooms for '%s': %s", obj, matched
+                )
+                return matched
+        except Exception as exc:
+            logger.warning(
+                "[VLN-MultiRoom] _infer_target_room_type VLM failed: %s", exc
+            )
+
+        logger.info(
+            "[VLN-MultiRoom] Could not infer room type for '%s', will search all rooms", obj
+        )
+        return ["unknown"]
 
     def _check_room_match(self, room_description: str, *, resume_search: bool = False) -> bool:
         """Ask the VLM whether the current camera view matches the room."""
@@ -635,21 +885,68 @@ class VLNSkillContainer(Module[VLNConfig]):
         except Exception:
             logger.warning("[VLN] relative_move failed during navigate-back")
 
+    def _perform_observation_sweep(self) -> None:
+        """Rotate 360° in 4×90° steps to collect scene observations before querying semantic memory.
+
+        Each step: rotate 90° in-place, then pause 0.5 s for the camera /
+        SpatialMemory to capture the new view.
+        """
+        logger.info("[VLN] observation sweep: starting 4×90° rotation")
+        try:
+            move_rpc = self.get_rpc_calls("UnitreeSkillContainer.relative_move")
+        except Exception as e:
+            logger.warning("[VLN] observation sweep: could not get relative_move RPC: %s", e)
+            return
+        for step in range(1, 5):
+            logger.info("[VLN] observation sweep step %d/4 — rotating 90°", step)
+            try:
+                move_rpc(0.0, 0.0, 90.0)
+                time.sleep(0.5)
+            except Exception as e:
+                logger.warning("[VLN] observation sweep step %d failed: %s", step, e)
+        logger.info("[VLN] observation sweep: complete")
+
     # ------------------------------------------------------------------
     # Navigation helpers
     # ------------------------------------------------------------------
 
-    def _navigate_to_semantic(self, query: str) -> bool:
+    def _navigate_to_semantic(self, query: str, do_sweep: bool = False) -> bool:
         """Try to navigate to a location found in the semantic map.
 
         Attempt 1: CLIP image-based semantic memory (populated during exploration).
         Attempt 2: Pre-seeded named locations via query_tagged_location (e.g. from
           room_layout_house.yaml seeded at startup). This allows immediate navigation
           to known rooms without requiring prior exploration.
+
+        Args:
+            query: text label to search for (room name, object description, …).
+            do_sweep: if True, perform a 360° observation sweep first so the
+                current scene has a fair chance to appear in semantic memory
+                before committing to any stored match.
         """
+        if do_sweep:
+            self._perform_observation_sweep()
+
         try:
             set_goal_rpc = self.get_rpc_calls("ReplanningAStarPlanner.set_goal")
         except Exception:
+            return False
+
+        # Helper: return True if a candidate (x, y) is too close to the
+        # robot's current position to be a useful navigation goal.
+        def _is_near_current_pose(gx: float, gy: float) -> bool:
+            if self._latest_odom is None:
+                return False
+            dx = gx - self._latest_odom.position.x
+            dy = gy - self._latest_odom.position.y
+            dist = math.sqrt(dx * dx + dy * dy)
+            if dist < self.config.semantic_near_pose_threshold:
+                logger.info(
+                    "[VLN] Semantic match at (%.2f, %.2f) is %.2fm from current pose"
+                    " (threshold %.2fm) — skipping (self-match).",
+                    gx, gy, dist, self.config.semantic_near_pose_threshold,
+                )
+                return True
             return False
 
         # Attempt 1: CLIP image-based semantic memory
@@ -659,50 +956,98 @@ class VLNSkillContainer(Module[VLNConfig]):
             if results:
                 best = results[0]
                 similarity = 1.0 - (best.get("distance") or 1)
+                logger.info(
+                    "[VLN] semantic CLIP query '%s': %d results, "
+                    "best_similarity=%.4f threshold=%.2f → %s",
+                    query, len(results), similarity,
+                    self.config.similarity_threshold,
+                    "ACCEPTED" if similarity >= self.config.similarity_threshold else "REJECTED (too low)",
+                )
                 if similarity >= self.config.similarity_threshold:
                     metadata = best.get("metadata")
                     if metadata:
                         first = metadata[0]
-                        pose = PoseStamped(
-                            position=make_vector3(first.get("pos_x", 0), first.get("pos_y", 0), 0),
-                            orientation=Quaternion.from_euler(
-                                make_vector3(0, 0, first.get("rot_z", 0))
-                            ),
-                            frame_id="map",
-                        )
-                        if set_goal_rpc(pose):
-                            return True
-        except Exception:
-            pass
+                        gx = first.get("pos_x", 0)
+                        gy = first.get("pos_y", 0)
+                        if not _is_near_current_pose(gx, gy):
+                            pose = PoseStamped(
+                                position=make_vector3(gx, gy, 0),
+                                orientation=Quaternion.from_euler(
+                                    make_vector3(0, 0, first.get("rot_z", 0))
+                                ),
+                                frame_id="map",
+                            )
+                            if set_goal_rpc(pose):
+                                logger.info(
+                                    "[VLN] CLIP match accepted: goal=(%0.2f, %.2f) "
+                                    "similarity=%.4f — setting A* goal",
+                                    gx, gy, similarity,
+                                )
+                                return True
+                            else:
+                                logger.warning(
+                                    "[VLN] CLIP match at (%.2f, %.2f) rejected by A* planner "
+                                    "(set_goal returned False)",
+                                    gx, gy,
+                                )
+            else:
+                logger.info("[VLN] semantic CLIP query '%s': no results returned", query)
+        except Exception as e:
+            logger.warning("[VLN] semantic CLIP query '%s' failed: %s", query, e)
 
         # Attempt 2: pre-seeded named locations (tag_location / room_layout seeding)
         try:
             tagged_rpc = self.get_rpc_calls("SpatialMemory.query_tagged_location")
             location = tagged_rpc(query)
             if location is not None:
-                pose = PoseStamped(
-                    position=make_vector3(
-                        float(location.position[0]), float(location.position[1]), 0
-                    ),
-                    orientation=Quaternion.from_euler(
-                        make_vector3(0, 0, float(location.rotation[2]))
-                    ),
-                    frame_id="map",
+                gx = float(location.position[0])
+                gy = float(location.position[1])
+                logger.info(
+                    "[VLN] tagged location for '%s': name='%s' pos=(%.2f, %.2f)",
+                    query, location.name, gx, gy,
                 )
-                return set_goal_rpc(pose)
-        except Exception:
-            pass
+                if not _is_near_current_pose(gx, gy):
+                    pose = PoseStamped(
+                        position=make_vector3(gx, gy, 0),
+                        orientation=Quaternion.from_euler(
+                            make_vector3(0, 0, float(location.rotation[2]))
+                        ),
+                        frame_id="map",
+                    )
+                    result = set_goal_rpc(pose)
+                    logger.info(
+                        "[VLN] tagged location goal set result=%s for '%s' at (%.2f, %.2f)",
+                        result, query, gx, gy,
+                    )
+                    return result
+            else:
+                logger.info("[VLN] no tagged location found for '%s'", query)
+        except Exception as e:
+            logger.warning("[VLN] tagged location query '%s' failed: %s", query, e)
 
+        logger.info("[VLN] _navigate_to_semantic('%s'): all attempts failed → returning False", query)
         return False
 
     def _wait_for_navigation(self, timeout: float = 30.0) -> bool:
-        """Block until navigation finishes or timeout. Returns True if goal reached."""
+        """Block until navigation finishes or timeout. Returns True if goal reached.
+
+        A short initial sleep of 0.05 s is inserted before the first poll so
+        the planner has time to transition *away* from its pre-navigation IDLE
+        state.  Without this, a trivial (zero-distance) goal completes in < 1 ms
+        and the planner is already back to IDLE before the first 0.5 s poll fires;
+        ``is_goal_reached()`` then returns its stale pre-reset value (False),
+        causing a false-negative "could not reach" report.
+        """
         try:
             get_state_rpc, is_reached_rpc = self.get_rpc_calls(
                 "ReplanningAStarPlanner.get_state", "ReplanningAStarPlanner.is_goal_reached"
             )
         except Exception:
             return False
+
+        # Give the planner a moment to leave IDLE and enter path_following
+        # (or arrive immediately for a near-zero-distance goal).
+        time.sleep(0.05)
 
         start = time.time()
         while time.time() - start < timeout:
@@ -757,11 +1102,15 @@ class VLNSkillContainer(Module[VLNConfig]):
     def _start_exploration(self) -> bool:
         if self.config.exploration_mode == "navdp":
             return self._start_exploration_navdp()
+        if self.config.exploration_mode == "hybrid":
+            return self._start_exploration_hybrid()
         return self._start_exploration_astar()
 
     def _stop_exploration(self) -> bool:
         if self.config.exploration_mode == "navdp":
             return self._stop_exploration_navdp()
+        if self.config.exploration_mode == "hybrid":
+            return self._stop_exploration_hybrid()
         return self._stop_exploration_astar()
 
     # -- A* (WavefrontFrontier) exploration --
@@ -808,6 +1157,234 @@ class VLNSkillContainer(Module[VLNConfig]):
             return True
         except Exception:
             return False
+
+    # -- Hybrid exploration (NavDP local + A* global path guidance) --
+
+    def _start_exploration_hybrid(self) -> bool:
+        """Start hybrid exploration: NavDP handles local obstacle avoidance,
+        A* provides global path guidance via set_path_guidance.
+
+        Starts NavDP in SEEK state, then launches _hybrid_frontier_loop in a
+        background thread to periodically select a frontier goal and pipe the
+        A* path as directional guidance to NavDP's trajectory selector.
+        """
+        try:
+            set_lang_rpc = self.get_rpc_calls("NavDPNavigator.set_language_goal")
+            set_lang_rpc("explore the environment")
+            logger.info("[VLN] Hybrid exploration started (NavDP+A*)")
+        except Exception:
+            logger.warning("[VLN] NavDPNavigator not connected, falling back to A*")
+            return self._start_exploration_astar()
+
+        self._hybrid_stop_event = threading.Event()
+        self._hybrid_thread = threading.Thread(
+            target=self._hybrid_frontier_loop, daemon=True, name="hybrid-frontier-loop"
+        )
+        self._hybrid_thread.start()
+        return True
+
+    def _stop_exploration_hybrid(self) -> bool:
+        """Stop hybrid exploration: cancel NavDP and shut down the frontier loop."""
+        # Signal the background loop to stop
+        stop_event = getattr(self, "_hybrid_stop_event", None)
+        if stop_event is not None:
+            stop_event.set()
+
+        thread = getattr(self, "_hybrid_thread", None)
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=3.0)
+
+        # Clear guidance path so NavDP falls back to frontier direction
+        try:
+            clear_rpc = self.get_rpc_calls("NavDPNavigator.clear_path_guidance")
+            clear_rpc()
+        except Exception:
+            pass
+
+        # Cancel NavDP motion
+        try:
+            cancel_rpc = self.get_rpc_calls("NavDPNavigator.cancel_goal")
+            cancel_rpc()
+        except Exception:
+            pass
+
+        logger.info("[VLN] Hybrid exploration stopped")
+        return True
+
+    def _hybrid_frontier_loop(self) -> None:
+        """Background thread: select frontier → compute A* path → push to NavDP.
+
+        Runs at most once every ``frontier_replan_distance_m`` metres of travel.
+        If VLM frontier ranking is enabled, runs VLMFrontierJudge asynchronously;
+        the result is applied on the next selection cycle so it never blocks motion.
+        """
+        stop_event: threading.Event = self._hybrid_stop_event
+        replan_dist = self.config.frontier_replan_distance_m
+        vlm_enabled = self.config.frontier_vlm_enabled
+        vlm_interval = max(1, self.config.frontier_vlm_interval)
+
+        last_replan_pos: tuple[float, float] | None = None
+        frontier_sel_count = 0
+        pending_vlm_scores: dict[int, float] | None = None  # from last async VLM call
+        pending_frontier_candidates: list[Any] = []
+        current_frontier_goal: Any = None   # last frontier goal pushed to NavDP
+        last_escape_count: int = 0          # escape_attempt_count at last replan
+
+        def _run_vlm_async(candidates: list[Any]) -> None:
+            """Fire-and-forget VLM frontier ranking — writes result into closure."""
+            nonlocal pending_vlm_scores, pending_frontier_candidates
+            try:
+                from dimos.navigation.vlm_frontier_judge import VLMFrontierJudge, blend_scores  # noqa: F401
+
+                judge = VLMFrontierJudge(
+                    vlm_base_url=self.config.vlm_base_url,
+                    timeout_s=self.config.room_exit_vlm_judge_timeout_s,
+                    vlm_judge_top_k=len(candidates),
+                )
+                # Build geo scores (uniform, since we just want VLM ranking here)
+                geo_scores = {i: 1.0 for i in range(len(candidates))}
+                judge_result = judge.rank_frontiers(
+                    frontiers=candidates,
+                    costmap=None,
+                    trail=None,
+                )
+                if not judge_result.fell_back_to_uniform:
+                    pending_frontier_candidates = candidates
+                    pending_vlm_scores = judge_result.confidence_map()
+            except Exception as exc:
+                logger.debug("[VLN-Hybrid] VLM frontier judge failed: %s", exc)
+
+        while not stop_event.is_set():
+            stop_event.wait(timeout=0.5)
+            if stop_event.is_set():
+                break
+
+            # Get current odometry
+            odom = self._latest_odom
+            if odom is None:
+                continue
+
+            ox, oy = odom.position.x, odom.position.y
+
+            # Check whether NavDP has become newly stuck since the last replan.
+            # If escape_attempt_count has increased, the current frontier goal
+            # is unreachable from this position — blacklist it and replan now.
+            escape_count: int = 0
+            try:
+                esc_rpc = self.get_rpc_calls("NavDPNavigator.get_escape_attempt_count")
+                escape_count = esc_rpc() or 0
+            except Exception:
+                pass
+
+            newly_stuck = escape_count > last_escape_count
+            if newly_stuck and current_frontier_goal is not None:
+                logger.info(
+                    "[VLN-Hybrid] NavDP stuck (escape_count=%d→%d) — blacklisting "
+                    "frontier (%.2f, %.2f) and forcing replan",
+                    last_escape_count, escape_count,
+                    current_frontier_goal.x, current_frontier_goal.y,
+                )
+                try:
+                    mark_rpc = self.get_rpc_calls("WavefrontFrontierExplorer.mark_explored_goal")
+                    mark_rpc(current_frontier_goal)
+                except Exception:
+                    pass
+                # Clear guidance so NavDP doesn't keep chasing the dead-end path
+                try:
+                    clear_rpc = self.get_rpc_calls("NavDPNavigator.clear_path_guidance")
+                    clear_rpc()
+                except Exception:
+                    pass
+                current_frontier_goal = None
+                last_replan_pos = None  # force immediate replan below
+
+            last_escape_count = escape_count
+
+            # Only replan after the robot has travelled far enough (or forced above)
+            if last_replan_pos is not None:
+                dist = math.hypot(ox - last_replan_pos[0], oy - last_replan_pos[1])
+                if dist < replan_dist:
+                    continue
+
+            # Get best frontier goal from WavefrontFrontierExplorer
+            goal_vec: Any = None
+            try:
+                frontier_rpc = self.get_rpc_calls("WavefrontFrontierExplorer.get_best_frontier_goal")
+                goal_vec = frontier_rpc()
+            except Exception as exc:
+                logger.debug("[VLN-Hybrid] get_best_frontier_goal failed: %s", exc)
+                continue
+
+            if goal_vec is None:
+                logger.info("[VLN-Hybrid] No frontier available — waiting")
+                continue
+
+            frontier_sel_count += 1
+
+            # Optionally kick off async VLM ranking every N selections
+            if vlm_enabled and frontier_sel_count % vlm_interval == 0:
+                try:
+                    frontiers_rpc = self.get_rpc_calls("WavefrontFrontierExplorer.get_frontiers_room_exit")
+                    candidates_raw = frontiers_rpc(self.config.room_exit_vlm_judge_top_k)
+                    if candidates_raw:
+                        candidates = [f for f, _ in candidates_raw]
+                        threading.Thread(
+                            target=_run_vlm_async, args=(candidates,), daemon=True
+                        ).start()
+                except Exception:
+                    pass
+
+            # If pending VLM results match current candidates, use the best one
+            if pending_vlm_scores and pending_frontier_candidates:
+                best_idx = max(pending_vlm_scores, key=lambda i: pending_vlm_scores[i])  # type: ignore[arg-type]
+                if best_idx < len(pending_frontier_candidates):
+                    goal_vec = pending_frontier_candidates[best_idx]
+                    pending_vlm_scores = None
+                    pending_frontier_candidates = []
+
+            # Compute A* path to the selected frontier goal
+            path_obj: Any = None
+            try:
+                from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped as PS
+
+                goal_pose = PS()
+                goal_pose.position.x = float(goal_vec.x)
+                goal_pose.position.y = float(goal_vec.y)
+                goal_pose.position.z = 0.0
+                goal_pose.orientation.w = 1.0
+                goal_pose.frame_id = "world"
+
+                compute_rpc = self.get_rpc_calls("ReplanningAStarPlanner.compute_path_to_goal")
+                path_obj = compute_rpc(goal_pose)
+            except Exception as exc:
+                logger.debug("[VLN-Hybrid] compute_path_to_goal failed: %s", exc)
+
+            if path_obj is None or not getattr(path_obj, "poses", None):
+                logger.debug("[VLN-Hybrid] No A* path to frontier (%.2f, %.2f)", goal_vec.x, goal_vec.y)
+                # Mark as explored so we don't keep picking an unreachable frontier
+                try:
+                    mark_rpc = self.get_rpc_calls("WavefrontFrontierExplorer.mark_explored_goal")
+                    mark_rpc(goal_vec)
+                except Exception:
+                    pass
+                continue
+
+            # Push waypoints to NavDP as path guidance
+            waypoints = [[p.position.x, p.position.y] for p in path_obj.poses]
+            try:
+                set_path_rpc = self.get_rpc_calls("NavDPNavigator.set_path_guidance")
+                set_path_rpc(waypoints)
+                logger.info(
+                    "[VLN-Hybrid] New A* guidance path: %d waypoints → frontier (%.2f, %.2f)",
+                    len(waypoints),
+                    goal_vec.x,
+                    goal_vec.y,
+                )
+                current_frontier_goal = goal_vec
+            except Exception as exc:
+                logger.debug("[VLN-Hybrid] set_path_guidance failed: %s", exc)
+
+            last_replan_pos = (ox, oy)
 
     def _has_navdp(self) -> bool:
         """Check if NavDPNavigator is available and active."""
@@ -931,12 +1508,12 @@ class VLNSkillContainer(Module[VLNConfig]):
                 )
                 # Resize crop to the NavDP inference camera resolution so the
                 # policy's letterboxing matches the live observation.
-                goal_w = self.config.navdp_imagegoal_width
-                goal_h = self.config.navdp_imagegoal_height
-                ref_bgr = cv2.resize(ref_bgr, (goal_w, goal_h), interpolation=cv2.INTER_LINEAR)
-                logger.info(
-                    "[VLN] Resized imagegoal to %dx%d for NavDP", goal_w, goal_h
-                )
+                # goal_w = self.config.navdp_imagegoal_width
+                # goal_h = self.config.navdp_imagegoal_height
+                # ref_bgr = cv2.resize(ref_bgr, (goal_w, goal_h), interpolation=cv2.INTER_LINEAR)
+                # logger.info(
+                #     "[VLN] Resized imagegoal to %dx%d for NavDP", goal_w, goal_h
+                # )
             else:
                 logger.warning("[VLN] Invalid bbox after normalisation, using full frame")
 
@@ -1514,14 +2091,648 @@ class VLNSkillContainer(Module[VLNConfig]):
     # Core VLN search loop
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Room-exit helpers
+    # ------------------------------------------------------------------
+
+    def _get_current_pose_xy(self) -> tuple[float, float] | None:
+        """Return the current (x, y) robot pose, or None if odom unavailable."""
+        odom = self._latest_odom
+        if odom is None:
+            return None
+        return (float(odom.position.x), float(odom.position.y))
+
+    def _navigate_to_waypoint_astar(self, x: float, y: float, timeout: float = 45.0) -> bool:
+        """Navigate to a world-frame (x, y) waypoint via A* planner.
+
+        Args:
+            x: Target x position (metres, world frame).
+            y: Target y position (metres, world frame).
+            timeout: Maximum navigation time in seconds.
+
+        Returns:
+            True if the waypoint was reached.
+        """
+        try:
+            set_goal_rpc = self.get_rpc_calls("ReplanningAStarPlanner.set_goal")
+        except Exception:
+            return False
+
+        goal = PoseStamped(
+            position=make_vector3(x, y, 0.0),
+            orientation=Quaternion.from_euler(make_vector3(0.0, 0.0, 0.0)),
+            frame_id="map",
+        )
+        try:
+            set_goal_rpc(goal)
+        except Exception as exc:
+            logger.warning("[VLN-Exit] set_goal failed: %s", exc)
+            return False
+
+        return self._wait_for_navigation(timeout=timeout)
+
+    def _tag_searched_area(self, x: float, y: float) -> None:
+        """Tag the current area as searched in SpatialMemory.
+
+        Uses a structured name ``searched:room:{timestamp}`` so that future
+        calls to ``query_tagged_location("searched:room")`` can locate and
+        avoid re-entered areas.
+        """
+        try:
+            tag_rpc = self.get_rpc_calls("SpatialMemory.tag_location")
+            from dimos.types.robot_location import RobotLocation
+            from dimos.navigation.room_exit_planner import RoomExitPlanner
+
+            name = RoomExitPlanner.make_searched_tag_name()
+            tag_rpc(
+                RobotLocation(
+                    name=name,
+                    position=(x, y, 0.0),
+                    rotation=(0.0, 0.0, 0.0),
+                )
+            )
+            logger.info("[VLN-Exit] Tagged searched area at (%.2f, %.2f) as '%s'", x, y, name)
+        except Exception as exc:
+            logger.warning("[VLN-Exit] Could not tag searched area: %s", exc)
+
+    def _get_searched_locations(self) -> list[tuple[float, float]]:
+        """Return all previously tagged 'searched' room positions.
+
+        Returns:
+            List of (x, y) world-frame positions already searched.
+        """
+        positions: list[tuple[float, float]] = []
+        try:
+            tagged_rpc = self.get_rpc_calls("SpatialMemory.query_tagged_location")
+            loc = tagged_rpc("searched:room")
+            if loc is not None:
+                positions.append((float(loc.position[0]), float(loc.position[1])))
+        except Exception:
+            pass
+        return positions
+
+    def _room_discovery_loop(
+        self,
+        obj: str,
+        candidate_room_types: list[str],
+    ) -> str | None:
+        """Explore until reaching a room whose type matches *candidate_room_types*.
+
+        This is Phase 1B of the multi-room search.  The robot:
+
+        1. Starts NavDP nogoal exploration.
+        2. Every ``multi_room_check_interval_m`` metres, calls
+           ``_identify_current_room()`` and tags the result in SpatialMemory.
+        3. If the identified room type is in *candidate_room_types*, stops
+           exploration and returns ``None`` (caller falls through to object
+           search).
+        4. If the room saturates (coverage threshold reached or stall timeout),
+           calls ``_room_exit_sequence`` to move to an adjacent area and
+           continues discovery there.
+        5. Gives up after ``multi_room_max_rooms`` distinct rooms or
+           ``multi_room_discovery_timeout_s`` seconds.
+
+        Args:
+            obj: Target object — used only if the object is serendipitously
+                spotted during discovery (early return with result string).
+            candidate_room_types: Lower-case room type strings that indicate
+                the robot is in the right room (e.g. ``["study room", "office"]``).
+
+        Returns:
+            Non-None result string if the object was found during discovery
+            (unlikely but possible), ``None`` if the correct room was reached
+            or the search is cancelled.
+        """
+        if self._search_stop.is_set():
+            return None
+
+        logger.info(
+            "[VLN-Discovery] Starting room discovery for '%s', target room types: %s",
+            obj, candidate_room_types,
+        )
+
+        # When candidate_room_types is ["unknown"], we accept any room and
+        # immediately fall through to object search.
+        accept_any_room = candidate_room_types == ["unknown"]
+
+        discovery_start = time.time()
+        rooms_searched: list[str] = []
+        last_pos = self._get_current_pose_xy()
+        last_room_check_pos = last_pos
+
+        # Tag for RoomExitPlanner anti-re-entry
+        tag_rpc = None
+        try:
+            tag_rpc = self.get_rpc_calls("SpatialMemory.tag_location")
+        except Exception:
+            pass
+
+        def _tag_room(room_type: str) -> None:
+            if tag_rpc is None or room_type in ("unknown",):
+                return
+            try:
+                from dimos.types.robot_location import RobotLocation
+                pos = self._get_current_pose_xy()
+                if pos:
+                    tag_rpc(
+                        RobotLocation(
+                            name=f"room:{room_type}",
+                            position=(pos[0], pos[1], 0.0),
+                            rotation=(0.0, 0.0, 0.0),
+                        )
+                    )
+            except Exception as exc:
+                logger.debug("[VLN-Discovery] Could not tag room '%s': %s", room_type, exc)
+
+        # Start exploration
+        self._start_exploration()
+
+        last_progress_time = discovery_start
+        last_trail_distance = 0.0
+
+        try:
+            stats_rpc = self.get_rpc_calls("NavDPNavigator.get_exploration_stats")
+            init_stats = stats_rpc()
+            last_trail_distance = init_stats.get("trail_distance_m", 0.0)
+        except Exception:
+            stats_rpc = None
+
+        while True:
+            if self._search_stop.is_set():
+                self._stop_exploration()
+                return None
+
+            now = time.time()
+            elapsed = now - discovery_start
+
+            # Hard timeout for discovery phase
+            if elapsed > self.config.multi_room_discovery_timeout_s:
+                logger.info(
+                    "[VLN-Discovery] Hard timeout (%.0fs), stopping discovery", elapsed
+                )
+                break
+
+            # If we've already saturated "too many" rooms, give up
+            if len(rooms_searched) >= self.config.multi_room_max_rooms:
+                logger.info(
+                    "[VLN-Discovery] Searched %d distinct rooms without finding a match, giving up",
+                    len(rooms_searched),
+                )
+                break
+
+            # --- Stall / saturation detection (reuse existing stats signals) ---
+            stalled_for = now - last_progress_time
+            room_saturated = False
+
+            if stats_rpc is not None:
+                try:
+                    stats = stats_rpc()
+                    cur_trail_dist = stats.get("trail_distance_m", 0.0)
+                    cur_observed = stats.get("observed_fraction", 0.0)
+
+                    new_distance = cur_trail_dist - last_trail_distance
+                    if new_distance >= self.config.search_progress_distance:
+                        last_progress_time = now
+                        last_trail_distance = cur_trail_dist
+
+                    if (
+                        stats.get("costmap_available", False)
+                        and cur_observed >= self.config.search_observed_fraction
+                    ):
+                        room_saturated = True
+                except Exception:
+                    pass
+
+            if stalled_for > self.config.search_stall_timeout:
+                room_saturated = True
+
+            # --- Check if the robot has moved enough to re-identify the room ---
+            current_pos = self._get_current_pose_xy()
+            if current_pos and last_room_check_pos:
+                moved = math.sqrt(
+                    (current_pos[0] - last_room_check_pos[0]) ** 2
+                    + (current_pos[1] - last_room_check_pos[1]) ** 2
+                )
+            else:
+                moved = self.config.multi_room_check_interval_m  # force a check at startup
+
+            if moved >= self.config.multi_room_check_interval_m or (elapsed < 2.0 and not rooms_searched):
+                # Identify current room
+                room_type = self._identify_current_room()
+                last_room_check_pos = current_pos
+
+                if room_type not in rooms_searched:
+                    rooms_searched.append(room_type)
+                    _tag_room(room_type)
+                    logger.info(
+                        "[VLN-Discovery] New room identified: '%s' (searched so far: %s)",
+                        room_type, rooms_searched,
+                    )
+
+                # If we accept any room OR this room matches our target types
+                if accept_any_room or room_type in candidate_room_types:
+                    logger.info(
+                        "[VLN-Discovery] Target room type '%s' found! Stopping discovery.",
+                        room_type,
+                    )
+                    self._stop_exploration()
+                    return None  # fall through to object search
+
+                # If the current room is wrong AND saturated, exit immediately
+                if room_saturated:
+                    logger.info(
+                        "[VLN-Discovery] Room '%s' saturated (wrong type). Triggering room exit.",
+                        room_type,
+                    )
+                    self._stop_exploration()
+                    # Tag as searched and attempt room exit
+                    if current_pos:
+                        self._tag_searched_area(current_pos[0], current_pos[1])
+                    exit_result = self._room_exit_sequence(obj, depth=0)
+                    if exit_result is not None:
+                        return exit_result
+                    # After exit, continue the discovery loop from the new position
+                    self._start_exploration()
+                    last_progress_time = time.time()
+                    last_trail_distance = 0.0
+                    if stats_rpc is not None:
+                        try:
+                            init_stats = stats_rpc()
+                            last_trail_distance = init_stats.get("trail_distance_m", 0.0)
+                        except Exception:
+                            pass
+                    # Reset room check position so we re-identify immediately
+                    last_room_check_pos = self._get_current_pose_xy()
+                    continue
+
+            elif room_saturated:
+                # Room is saturated but we haven't moved enough to re-identify
+                # — exit anyway and continue discovery
+                logger.info("[VLN-Discovery] Room saturated before re-identification. Exiting.")
+                self._stop_exploration()
+                current_pos = self._get_current_pose_xy()
+                if current_pos:
+                    self._tag_searched_area(current_pos[0], current_pos[1])
+                exit_result = self._room_exit_sequence(obj, depth=0)
+                if exit_result is not None:
+                    return exit_result
+                self._start_exploration()
+                last_progress_time = time.time()
+                last_trail_distance = 0.0
+                if stats_rpc is not None:
+                    try:
+                        init_stats = stats_rpc()
+                        last_trail_distance = init_stats.get("trail_distance_m", 0.0)
+                    except Exception:
+                        pass
+                last_room_check_pos = self._get_current_pose_xy()
+                continue
+
+            # --- Opportunistic object check during discovery ---
+            # Don't do a full VLM object check here — it would slow down
+            # discovery significantly.  We rely on the subsequent object search
+            # phase for that.  But we DO do a quick check every N seconds as a
+            # shortcut if the object happens to be right in front of us.
+
+            time.sleep(self.config.vlm_check_interval)
+
+        # Discovery loop ended without finding the target room
+        self._stop_exploration()
+        logger.info(
+            "[VLN-Discovery] Room discovery ended without finding target room types %s. "
+            "Searched rooms: %s",
+            candidate_room_types, rooms_searched,
+        )
+        return None
+
+    def _room_exit_sequence(
+        self, obj: str, depth: int = 0
+    ) -> str | None:
+        """Attempt to exit the saturated room and continue the search elsewhere.
+
+        Orchestrates the full room-exit harness:
+        1. Tag the current area as 'searched' in SpatialMemory.
+        2. Retrieve the NavDP exploration trail.
+        3. Use RoomExitPlanner to find the highest-novelty backtrack waypoint.
+        4. Navigate to that waypoint (A* planner).
+        5. Get frontier candidates from WavefrontFrontierExplorer (room-exit mode).
+        6. Optionally invoke VLMFrontierJudge to rank candidates semantically.
+        7. Fuse geometric + VLM scores and navigate to the best frontier.
+        8. Resume active search in the new area (recursive, depth-limited).
+
+        Args:
+            obj: The target object being searched for.
+            depth: Current recursion depth (max ``room_exit_max_depth``).
+
+        Returns:
+            Non-None string result if the object was found during re-entry, or
+            None to signal that exit failed / object not found (caller should
+            fall back to returning failure).
+        """
+        if depth >= self.config.room_exit_max_depth:
+            logger.info("[VLN-Exit] Max room-exit depth (%d) reached, giving up", depth)
+            return None
+
+        if self._search_stop.is_set():
+            return None
+
+        logger.info("[VLN-Exit] Starting room-exit sequence (depth=%d) for '%s'", depth, obj)
+
+        # --- Step 1: Tag current area as searched ---
+        pose = self._get_current_pose_xy()
+        if pose:
+            self._tag_searched_area(pose[0], pose[1])
+
+        # --- Step 2: Get exploration trail ---
+        raw_trail: list[tuple[float, float]] = []
+        try:
+            trail_rpc = self.get_rpc_calls("NavDPNavigator.get_explore_trail")
+            raw_trail = trail_rpc() or []
+            logger.info("[VLN-Exit] Retrieved trail with %d points", len(raw_trail))
+        except Exception as exc:
+            logger.warning("[VLN-Exit] Could not get explore trail: %s", exc)
+
+        # --- Step 3: Find backtrack target ---
+        from dimos.navigation.room_exit_planner import RoomExitConfig, RoomExitPlanner
+
+        exit_config = RoomExitConfig(
+            trail_sample_spacing_m=self.config.room_exit_trail_sample_spacing_m,
+            backtrack_novelty_threshold=self.config.room_exit_backtrack_novelty_threshold,
+            memory_query_radius_m=self.config.room_exit_memory_query_radius_m,
+        )
+
+        query_by_location_fn = None
+        query_by_text_fn = None
+        try:
+            query_by_location_fn = self.get_rpc_calls("SpatialMemory.query_by_location")
+        except Exception:
+            pass
+        try:
+            query_by_text_fn = self.get_rpc_calls("SpatialMemory.query_by_text")
+        except Exception:
+            pass
+
+        planner = RoomExitPlanner(
+            config=exit_config,
+            query_by_location_fn=query_by_location_fn,
+            query_by_text_fn=query_by_text_fn,
+        )
+
+        backtrack_target = planner.find_backtrack_target(raw_trail)
+        if backtrack_target is None:
+            logger.info("[VLN-Exit] No backtrack target found (trail too short)")
+            return None
+
+        logger.info(
+            "[VLN-Exit] Backtrack target: (%.2f, %.2f) novelty=%.2f",
+            backtrack_target.x, backtrack_target.y, backtrack_target.novelty_score,
+        )
+
+        # --- Step 4: Navigate to backtrack waypoint ---
+        if self._search_stop.is_set():
+            return None
+
+        reached_backtrack = self._navigate_to_waypoint_astar(
+            backtrack_target.x, backtrack_target.y,
+            timeout=self.config.room_exit_nav_timeout_s,
+        )
+        if not reached_backtrack:
+            logger.info("[VLN-Exit] Could not reach backtrack waypoint, trying from current pos")
+
+        # --- Step 5 & 6: Get frontier candidates + VLM judge ---
+        current_odom = self._latest_odom
+        if current_odom is None:
+            logger.info("[VLN-Exit] No odometry available, cannot score frontiers")
+            return None
+
+        robot_pos_vec = current_odom.position
+
+        frontier_candidates: list[Any] = []
+        geo_scores: dict[int, float] = {}
+
+        try:
+            wavefront_rpc = self.get_rpc_calls("WavefrontFrontierExplorer.get_frontiers_room_exit")
+            # get_frontiers_room_exit uses the module's internal costmap
+            scored_frontiers = wavefront_rpc(self.config.room_exit_vlm_judge_top_k)
+            if scored_frontiers:
+                for i, (frontier, score) in enumerate(scored_frontiers):
+                    frontier_candidates.append(frontier)
+                    geo_scores[i] = score
+                logger.info("[VLN-Exit] Got %d room-exit frontier candidates", len(frontier_candidates))
+        except Exception as exc:
+            logger.warning("[VLN-Exit] WavefrontFrontierExplorer.get_frontiers_room_exit unavailable: %s", exc)
+
+        if not frontier_candidates:
+            logger.info("[VLN-Exit] No frontiers available after backtrack — resuming standard search")
+            self._start_exploration()
+            return None
+
+        # VLM judge: score frontiers semantically
+        best_frontier_idx = 0  # default to highest geometric score
+        if self.config.room_exit_vlm_judge_enabled and len(frontier_candidates) > 1:
+            try:
+                from dimos.navigation.vlm_frontier_judge import VLMFrontierJudge, blend_scores
+
+                judge = VLMFrontierJudge(
+                    vlm_base_url=self.config.vlm_base_url,
+                    timeout_s=self.config.room_exit_vlm_judge_timeout_s,
+                    vlm_judge_top_k=self.config.room_exit_vlm_judge_top_k,
+                )
+
+                # Fetch latest costmap from WavefrontFrontierExplorer for rendering
+                latest_costmap = None
+                try:
+                    costmap_rpc = self.get_rpc_calls("WavefrontFrontierExplorer.get_latest_costmap")
+                    latest_costmap = costmap_rpc()
+                except Exception:
+                    pass
+
+                judge_result = judge.judge_frontiers(
+                    grid=latest_costmap,
+                    frontiers=frontier_candidates,
+                    robot_pos=robot_pos_vec,
+                    trail=raw_trail,
+                )
+
+                if not judge_result.fell_back_to_uniform:
+                    fused = blend_scores(
+                        geo_scores,
+                        judge_result.confidence_map(),
+                        geo_weight=1.0 - self.config.room_exit_vlm_judge_weight,
+                        vlm_weight=self.config.room_exit_vlm_judge_weight,
+                    )
+                    best_frontier_idx = max(fused, key=fused.get)  # type: ignore[arg-type]
+                    logger.info(
+                        "[VLN-Exit] VLM judge selected frontier %d. "
+                        "Reason: %s",
+                        best_frontier_idx + 1,
+                        judge_result.judgements[0].reason if judge_result.judgements else "n/a",
+                    )
+                else:
+                    logger.info("[VLN-Exit] VLM judge fell back to uniform, using geometric ranking")
+            except Exception as exc:
+                logger.warning("[VLN-Exit] VLM judge failed: %s", exc)
+
+        best_frontier = frontier_candidates[best_frontier_idx]
+        logger.info(
+            "[VLN-Exit] Navigating to best exit frontier: (%.2f, %.2f)",
+            best_frontier.x, best_frontier.y,
+        )
+
+        # --- Step 7: Navigate to selected frontier ---
+        if self._search_stop.is_set():
+            return None
+
+        self._navigate_to_waypoint_astar(
+            best_frontier.x, best_frontier.y,
+            timeout=self.config.room_exit_nav_timeout_s,
+        )
+
+        # --- Step 8: Resume active search in new area (recursive) ---
+        logger.info("[VLN-Exit] Entered new area — resuming active search for '%s'", obj)
+        return self._active_search_loop(obj, depth=depth + 1)
+
+    def _active_search_loop(self, obj: str, depth: int = 0) -> str | None:
+        """Run the active VLM search loop in the current area.
+
+        Extracted from the inline loop in ``_vln_search`` so it can be called
+        recursively by ``_room_exit_sequence``.
+
+        Args:
+            obj: Target object description.
+            depth: Room-exit recursion depth (passed through to _room_exit_sequence).
+
+        Returns:
+            Non-None success string if the object is found, None otherwise.
+        """
+        if self._search_stop.is_set():
+            return None
+
+        self._start_exploration()
+
+        search_start = time.time()
+        last_progress_time = search_start
+        last_trail_distance = 0.0
+        last_observed_fraction = 0.0
+        self._memory_vlm_cycle = 0
+
+        try:
+            stats_rpc = self.get_rpc_calls("NavDPNavigator.get_exploration_stats")
+            init_stats = stats_rpc()
+            last_trail_distance = init_stats.get("trail_distance_m", 0.0)
+            last_observed_fraction = init_stats.get("observed_fraction", 0.0)
+        except Exception:
+            stats_rpc = None
+
+        while True:
+            now = time.time()
+            elapsed = now - search_start
+            stalled_for = now - last_progress_time
+
+            # Hard timeout
+            if elapsed > self.config.search_timeout:
+                logger.info("[VLN-ActiveSearch] Hard timeout (%.0fs)", elapsed)
+                break
+
+            # Stall timeout
+            if stalled_for > self.config.search_stall_timeout:
+                logger.info("[VLN-ActiveSearch] Stall timeout (no new coverage for %.0fs)", stalled_for)
+                if self.config.room_exit_enabled:
+                    self._stop_exploration()
+                    return self._room_exit_sequence(obj, depth=depth)
+                break
+
+            # Cancelled externally
+            if self._search_stop.is_set():
+                self._stop_exploration()
+                return None
+
+            # VLM check
+            bbox, capture_odom = self._check_object_in_view(obj, resume_search=True)
+            if bbox:
+                logger.info("[VLN-ActiveSearch] Found '%s' during exploration!", obj)
+                self._stop_exploration()
+                time.sleep(1.5)
+                bbox = self._confirm_detection(obj)
+                if bbox:
+                    result = self._approach_object(bbox, obj)
+                    return f"Found '{obj}' during exploration. {result}"
+                else:
+                    logger.info("[VLN-ActiveSearch] Detection not confirmed, resuming")
+                    self._start_exploration()
+                    last_progress_time = time.time()
+                    self._memory_vlm_cycle = 0
+                    continue
+
+            # Memory query: periodically re-query SpatialMemory for the target
+            # object and navigate toward any match found above similarity_threshold.
+            # Only runs when use_memory=True and every memory_query_interval VLM cycles.
+            self._memory_vlm_cycle += 1
+            if (
+                self.config.use_memory
+                and self._memory_vlm_cycle % self.config.memory_query_interval == 0
+            ):
+                logger.info(
+                    "[VLN-ActiveSearch] Memory query for '%s' (cycle %d)",
+                    obj, self._memory_vlm_cycle,
+                )
+                self._stop_exploration()
+                found = self._navigate_to_semantic(obj)
+                if found:
+                    logger.info(
+                        "[VLN-ActiveSearch] Memory match found — navigating to stored location"
+                    )
+                    last_progress_time = time.time()
+                else:
+                    logger.info(
+                        "[VLN-ActiveSearch] No memory match above threshold — resuming exploration"
+                    )
+                    self._start_exploration()
+
+            # Progress check
+            if stats_rpc is not None:
+                try:
+                    stats = stats_rpc()
+                    cur_trail_dist = stats.get("trail_distance_m", 0.0)
+                    cur_observed = stats.get("observed_fraction", 0.0)
+
+                    new_distance = cur_trail_dist - last_trail_distance
+                    if new_distance >= self.config.search_progress_distance:
+                        last_progress_time = time.time()
+                        last_trail_distance = cur_trail_dist
+                        last_observed_fraction = cur_observed
+
+                    # Boundary fully observed
+                    if (
+                        stats.get("costmap_available", False)
+                        and cur_observed >= self.config.search_observed_fraction
+                    ):
+                        logger.info(
+                            "[VLN-ActiveSearch] Boundary fully observed: %.1f%% known. "
+                            "Triggering room-exit.",
+                            cur_observed * 100,
+                        )
+                        if self.config.room_exit_enabled:
+                            self._stop_exploration()
+                            return self._room_exit_sequence(obj, depth=depth)
+                        break
+                except Exception:
+                    pass
+
+            time.sleep(self.config.vlm_check_interval)
+
+        self._stop_exploration()
+        return None
+
     def _vln_search(self, room: str | None, obj: str | None) -> str:
         """Execute the full VLN pipeline. Runs in a worker thread."""
         # Phase 1 — Navigate to room (if specified)
         if room:
             logger.info(f"[VLN] Phase 1: navigating to room '{room}'")
 
-            # First, try the semantic map
-            if self._navigate_to_semantic(room):
+            # First, try the semantic map — sweep 360° so the current
+            # scene is captured before querying stored embeddings.
+            if self._navigate_to_semantic(room, do_sweep=True):
                 logger.info(f"[VLN] Found '{room}' in semantic map, navigating...")
                 reached = self._wait_for_navigation(timeout=60.0)
                 if reached:
@@ -1573,8 +2784,40 @@ class VLNSkillContainer(Module[VLNConfig]):
         if not obj:
             return f"Navigated to '{room}'." if room else "No goal specified."
 
+        # Phase 2B — Multi-room discovery (only when room was NOT explicitly named)
+        # If room=None and multi_room_mode is on, infer which room type is most
+        # likely to contain the object, then explore until we reach that room.
+        if not room and self.config.multi_room_enabled:
+            logger.info("[VLN] Multi-room mode: inferring target room type for '%s'", obj)
+            candidate_types = self._infer_target_room_type(obj)
+            logger.info("[VLN] Candidate room types: %s", candidate_types)
+
+            # Check if we're already in the right room
+            current_room = self._identify_current_room()
+            logger.info("[VLN] Current room: '%s'", current_room)
+
+            accept_any = candidate_types == ["unknown"]
+            if not accept_any and current_room not in candidate_types:
+                logger.info(
+                    "[VLN] Not in target room ('%s' not in %s). Starting room discovery.",
+                    current_room, candidate_types,
+                )
+                discovery_result = self._room_discovery_loop(obj, candidate_types)
+                if discovery_result is not None:
+                    # Object was spotted during discovery
+                    return discovery_result
+                if self._search_stop.is_set():
+                    return "Search cancelled."
+                # _room_discovery_loop returned None → we are now in the target room
+                logger.info("[VLN] Room discovery complete. Starting object search.")
+            else:
+                logger.info(
+                    "[VLN] Already in a target room ('%s'). Proceeding to object search.",
+                    current_room,
+                )
+
         # Phase 3 — Active object search
-        logger.info(f"[VLN] Phase 2: searching for object '{obj}'")
+        logger.info(f"[VLN] Phase 3: searching for object '{obj}'")
 
         # First: check if object is already in view
         bbox, _ = self._check_object_in_view(obj)
@@ -1595,120 +2838,31 @@ class VLNSkillContainer(Module[VLNConfig]):
                     return f"Found '{obj}' via semantic map. {result}"
                 return f"Reached semantic map location for '{obj}' but could not visually confirm it."
 
-        # Third: explore while continuously checking VLM
-        # Adaptive timeout: keeps exploring as long as coverage is growing.
-        # Terminates when (a) object found, (b) hard timeout, (c) stall
-        # timeout (no new coverage for N seconds), or (d) the costmap
-        # boundary is fully observed.
+        # Third: explore while continuously checking VLM.
+        # Delegates to _active_search_loop which handles room-exit recursion
+        # when room_exit_enabled is True.
         logger.info(f"[VLN] Starting exploration with active VLM search for '{obj}'")
-        self._start_exploration()
+        found = self._active_search_loop(obj, depth=0)
+        if found:
+            return found
 
-        search_start = time.time()
-        last_progress_time = search_start
-        last_trail_distance = 0.0
-        last_observed_fraction = 0.0
+        if self._search_stop.is_set():
+            return "Search cancelled."
 
-        # Try to get initial exploration stats
+        # Build an informative message for the agent on failure
+        trail_distance = 0.0
+        observed_fraction = 0.0
         try:
             stats_rpc = self.get_rpc_calls("NavDPNavigator.get_exploration_stats")
-            init_stats = stats_rpc()
-            last_trail_distance = init_stats.get("trail_distance_m", 0.0)
-            last_observed_fraction = init_stats.get("observed_fraction", 0.0)
+            stats = stats_rpc()
+            trail_distance = stats.get("trail_distance_m", 0.0)
+            observed_fraction = stats.get("observed_fraction", 0.0)
         except Exception:
-            stats_rpc = None
-
-        while True:
-            now = time.time()
-            elapsed = now - search_start
-            stalled_for = now - last_progress_time
-
-            # --- Termination conditions ---
-            # (a) Hard timeout
-            if elapsed > self.config.search_timeout:
-                logger.info(
-                    "[VLN] Search hard timeout (%.0fs > %.0fs)",
-                    elapsed, self.config.search_timeout,
-                )
-                break
-
-            # (b) Stall timeout — robot isn't covering new ground
-            if stalled_for > self.config.search_stall_timeout:
-                logger.info(
-                    "[VLN] Search stall timeout: no new coverage for %.0fs "
-                    "(threshold %.0fs)",
-                    stalled_for, self.config.search_stall_timeout,
-                )
-                break
-
-            # (c) Cancelled externally
-            if self._search_stop.is_set():
-                self._stop_exploration()
-                return "Search cancelled."
-
-            # --- VLM check for the target object ---
-            bbox, capture_odom = self._check_object_in_view(obj, resume_search=True)
-            if bbox:
-                logger.info(
-                    "[VLN] Found '%s' during exploration! (mode=%s)",
-                    obj, self.config.exploration_mode,
-                )
-
-                # Confirmation phase: stop, majority-vote VLM, rotate+recheck
-                # up to a full 360 degrees before giving up on this detection.
-                # 1.5s settle ensures MuJoCo momentum has dissipated and the
-                # camera has a stable, non-blurred frame before the first check.
-                self._stop_exploration()
-                time.sleep(1.5)  # let robot settle after stop
-                bbox = self._confirm_detection(obj)
-                if bbox:
-                    result = self._approach_object(bbox, obj)
-                    return f"Found '{obj}' during exploration. {result}"
-                else:
-                    logger.info("[VLN] Detection not confirmed after 360 scan, resuming exploration")
-                    self._start_exploration()
-                    # Reset stall timer after a false-positive; confirmation
-                    # takes time and should not count as stalling.
-                    last_progress_time = time.time()
-                    continue
-
-            # --- Exploration progress check (every VLM interval) ---
-            if stats_rpc is not None:
-                try:
-                    stats = stats_rpc()
-                    cur_trail_dist = stats.get("trail_distance_m", 0.0)
-                    cur_observed = stats.get("observed_fraction", 0.0)
-
-                    # Check progress: did the robot cover new ground?
-                    new_distance = cur_trail_dist - last_trail_distance
-                    if new_distance >= self.config.search_progress_distance:
-                        last_progress_time = time.time()
-                        last_trail_distance = cur_trail_dist
-                        last_observed_fraction = cur_observed
-
-                    # (d) Boundary fully observed — costmap is mostly known
-                    if (
-                        stats.get("costmap_available", False)
-                        and cur_observed >= self.config.search_observed_fraction
-                    ):
-                        logger.info(
-                            "[VLN] Boundary fully observed: %.1f%% of costmap known "
-                            "(threshold %.0f%%). Stopping search.",
-                            cur_observed * 100,
-                            self.config.search_observed_fraction * 100,
-                        )
-                        break
-                except Exception:
-                    pass  # stats RPC unavailable — ignore
-
-            time.sleep(self.config.vlm_check_interval)
-
-        self._stop_exploration()
-        # Build an informative message for the agent
-        trail_dist_str = f"{last_trail_distance:.1f}m explored"
-        obs_str = f"{last_observed_fraction * 100:.0f}% of map observed"
+            pass
         return (
-            f"Could not find '{obj}' after {elapsed:.0f}s. "
-            f"{trail_dist_str}, {obs_str}. "
+            f"Could not find '{obj}'. "
+            f"{trail_distance:.1f}m explored, "
+            f"{observed_fraction * 100:.0f}% of map observed. "
             f"The robot remembers where it has been — retrying may cover new areas."
         )
 

@@ -1,0 +1,167 @@
+# NavDP trajectory and camera defaults
+# ---------------------------------------
+# Contains NavDP server settings, MPC tuning, trajectory selector,
+# and the full camera profile library.
+# Active camera is selected by trajectory_camera in each profile.
+
+vlm:
+  backend: qwen3_local
+  base_url: http://192.168.2.109:8000
+  model_name: Qwen3-VL-8B-Instruct
+
+agent:
+  model: ollama:qwen3:14b
+  ollama_base_url: http://192.168.2.109:11434
+
+navdp:
+  enabled: true
+  navdp_server_url: http://192.168.2.109:8880
+  vlm_server_url: http://192.168.2.109:8000
+
+  # Active camera — override in profile
+  trajectory_camera: go2
+
+  # Graceful network-failure: hold last velocity then decelerate to zero.
+  hold_duration_s: 0.0
+  decel_duration_s: 0.5
+
+  # VLM control: set false in VLN deployments so VLNSkillContainer owns VLM
+  enable_internal_vlm: false
+
+  # MPC tuning
+  mpc_horizon: 15
+  mpc_desired_v: 0.3
+  mpc_v_max: 0.4
+  mpc_w_max: 0.2
+  mpc_ref_gap: 3
+  goal_lookahead_m: 1.0
+
+  # Landmark manager
+  landmark_enabled: true
+  keyframe_dir: ""
+  scene_sim_thresh: 0.85
+  landmark_min_interval_s: 2.0
+  landmark_time_thresh_s: 5.0
+
+  # ROS2 cmd_vel topic (set to "" to disable Ros2CmdVelPublisher)
+  ros_cmdvel_topic: /cmd_vel
+
+  trajectory_selector:
+    enabled: true
+    cost_threshold: 50
+    unknown_penalty: 0.8
+    critic_weight: 0.8
+    costmap_weight: 0.8
+    collision_penalty: 1000.0
+    robot_length: 0.6
+    robot_half_width: 0.15
+    robot_radius: 0.30
+    horizon_m: 1.5
+    sample_step: 1
+    max_trajectory_cost: 50.0
+    min_trajectory_length: 0.3
+    critic_min_accept: -5.0
+    explore_weight: 5.0
+    explore_radius: 2.0
+    explore_endpoint_bonus: 1.0
+    recency_damping_count: 3
+    open_space_weight: 5.0
+    open_space_radius: 0.6
+    depth_obstacle_m: 0.5
+    direction_weight: 3.0
+    frontier_weight: 5.0
+
+  # ── Camera profiles ─────────────────────────────────────────────────────
+  # Each entry can be selected via trajectory_camera above.
+  cameras:
+
+    # Unitree Go2 built-in RGB camera (sim and real VLM/VLN)
+    go2:
+      intrinsic:
+        - [460.0, 0.0, 320.0]
+        - [0.0, 460.0, 240.0]
+        - [0.0, 0.0, 1.0]
+      x: 0.13
+      y: 0.00
+      z: 0.30
+      pitch: 0.157    # ~9° downward tilt
+      width: 640
+      height: 480
+      fps: 30
+
+    # Intel RealSense D435 (real deployment, in-process ROS2 bridge)
+    realsense_d435:
+      intrinsic:
+        - [614.0, 0.0, 320.0]
+        - [0.0, 614.0, 240.0]
+        - [0.0, 0.0, 1.0]
+      x: 0.15
+      y: 0.00
+      z: 0.28
+      pitch: 0.10     # ~6° downward tilt
+      width: 640
+      height: 480
+      fps: 30
+      ros2_rgb_topic: /camera/camera/color/image_raw/compressed
+      ros2_depth_topic: /camera/camera/aligned_depth_to_color/image_raw/compressed
+      ros2_depth_scale: 1000.0
+
+    # Simulated D435i in MuJoCo
+    d435i_sim:
+      intrinsic:
+        - [614.0, 0.0, 320.0]
+        - [0.0, 614.0, 240.0]
+        - [0.0, 0.0, 1.0]
+      x: -0.20
+      y: 0.00
+      z: 0.28
+      pitch: 0.10
+      width: 640
+      height: 480
+      fps: 30
+
+    # Intel RealSense D455i (real deployment)
+    d455i:
+      intrinsic:
+        - [382.0, 0.0, 320.0]
+        - [0.0, 382.0, 240.0]
+        - [0.0, 0.0, 1.0]
+      x: 0.15
+      y: 0.00
+      z: 0.30
+      pitch: 0.10
+      width: 640
+      height: 480
+      fps: 30
+      ros2_rgb_topic: /camera/camera/color/image_raw/compressed
+      ros2_depth_topic: /camera/camera/aligned_depth_to_color/image_raw/compressed
+      ros2_depth_scale: 1000.0
+
+    # Simulated D455i in MuJoCo
+    d455i_sim:
+      intrinsic:
+        - [382.0, 0.0, 320.0]
+        - [0.0, 382.0, 240.0]
+        - [0.0, 0.0, 1.0]
+      x: -0.20
+      y: 0.00
+      z: 0.30
+      pitch: 0.10
+      width: 640
+      height: 480
+      fps: 30
+
+    # RealSense via LCM bridge (ros2_dimos_lcm_bridge)
+    # intrinsic/width/height come live from camera_info; set only to override.
+    realsense_lcm:
+      intrinsic: null
+      width: null
+      height: null
+      x: -0.15
+      y: 0.00
+      z: 0.23
+      pitch: 0.10
+      fps: 30
+      lcm_rgb_basename: /dimos/realsense/rgb
+      lcm_depth_basename: /dimos/realsense/depth
+      lcm_camera_info_basename: /dimos/realsense/camera_info

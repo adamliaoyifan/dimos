@@ -1,0 +1,25 @@
+# Profile: MuJoCo simulation — multi-room house scene
+# ------------------------------------------------------
+# Usage:
+#   cfg = load_vln_config(profile="sim_house")
+#   VLN_CONFIG=sim_house dimos run unitree-go2-vln-local
+
+_meta:
+  description: "MuJoCo simulation, multi-room house scene"
+  prompt: sim
+
+deployment:
+  enabled: true
+  room_layout: configs/sim/room_layout_house.yaml
+
+navdp:
+  trajectory_camera: d435i_sim
+
+search:
+  navdp_imagegoal_debug_dir: /home/adamliao/work/dimos/assets/output/memory/spatial_memory
+
+room_exit:
+  enabled: true
+
+multi_room:
+  enabled: true

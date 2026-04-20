@@ -1,0 +1,22 @@
+# Profile: Real Unitree Go2 + RealSense via LCM bridge
+# ------------------------------------------------------
+# Usage:
+#   cfg = load_vln_config(profile="hardware_go2")
+#   VLN_CONFIG=hardware_go2 dimos run unitree-go2-vln-local
+#
+# Prerequisites:
+#   - ros2_dimos_lcm_bridge running on the bridge host
+#   - NavDP inference server at navdp_server_url
+#   - VLM server at vlm.base_url / navdp.vlm_server_url
+
+_meta:
+  description: "Real Go2 + RealSense D435 via ros2_dimos_lcm_bridge"
+  prompt: hardware
+
+deployment:
+  enabled: false
+  room_layout: ""
+
+navdp:
+  trajectory_camera: realsense_lcm
+  enable_internal_vlm: false

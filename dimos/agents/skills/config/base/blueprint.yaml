@@ -1,0 +1,10 @@
+# Blueprint / process defaults
+# ------------------------------
+
+blueprint:
+  enable_tts: false
+  n_workers: 8
+
+deployment:
+  enabled: false        # false = real hardware; true = simulation
+  room_layout: ""       # path to room layout YAML for SpatialMemory seeding

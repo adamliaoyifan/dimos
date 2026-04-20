@@ -68,6 +68,7 @@ class VLNWebInput(Module[VLNWebConfig]):
     color_image: In[Image]
     realsense_image: In[Image]
     realsense_depth: In[Image]
+    frontier_overlay_image: In[Image]
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
@@ -84,6 +85,7 @@ class VLNWebInput(Module[VLNWebConfig]):
         self._latest_frame: np.ndarray | None = None
         self._latest_realsense_frame: np.ndarray | None = None
         self._latest_depth_frame: np.ndarray | None = None
+        self._latest_frontier_frame: np.ndarray | None = None
         self._uploaded_image: np.ndarray | None = None
         self._status: str = "idle"
         self._setup_routes()
@@ -148,6 +150,14 @@ class VLNWebInput(Module[VLNWebConfig]):
                 media_type="multipart/x-mixed-replace; boundary=frame",
             )
 
+        @self._app.get("/frontier_feed")
+        async def frontier_feed() -> StreamingResponse:
+            """MJPEG stream of frontier overlay."""
+            return StreamingResponse(
+                self._mjpeg_frontier(),
+                media_type="multipart/x-mixed-replace; boundary=frame",
+            )
+
         @self._app.get("/uploaded_image")
         async def get_uploaded() -> JSONResponse:
             """Return the uploaded reference image as base64."""
@@ -182,6 +192,15 @@ class VLNWebInput(Module[VLNWebConfig]):
                 yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n"
             time.sleep(0.1)
 
+    def _mjpeg_frontier(self) -> Iterator[bytes]:
+        while True:
+            if self._latest_frontier_frame is not None:
+                _, buf = cv2.imencode(
+                    ".jpg", self._latest_frontier_frame, [cv2.IMWRITE_JPEG_QUALITY, 70]
+                )
+                yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n"
+            time.sleep(0.1)
+
     @rpc
     def start(self) -> None:
         super().start()
@@ -189,6 +208,7 @@ class VLNWebInput(Module[VLNWebConfig]):
         self._disposables.add(Disposable(self.color_image.subscribe(self._on_image)))
         self._disposables.add(Disposable(self.realsense_image.subscribe(self._on_realsense_image)))
         self._disposables.add(Disposable(self.realsense_depth.subscribe(self._on_realsense_depth)))
+        self._disposables.add(Disposable(self.frontier_overlay_image.subscribe(self._on_frontier_overlay)))
 
         config = uvicorn.Config(
             self._app,
@@ -218,6 +238,10 @@ class VLNWebInput(Module[VLNWebConfig]):
     def _on_realsense_image(self, image: Image) -> None:
         if hasattr(image, "data") and image.data is not None:
             self._latest_realsense_frame = cv2.cvtColor(image.data, cv2.COLOR_RGB2BGR)
+
+    def _on_frontier_overlay(self, image: Image) -> None:
+        if hasattr(image, "data") and image.data is not None:
+            self._latest_frontier_frame = cv2.cvtColor(image.data, cv2.COLOR_RGB2BGR)
 
     def _on_realsense_depth(self, image: Image) -> None:
         if not hasattr(image, "data") or image.data is None:
@@ -254,7 +278,7 @@ _VLN_HTML = """<!DOCTYPE html>
   body { font-family: system-ui, -apple-system, sans-serif; background: #1a1a2e; color: #eee; }
   .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
   h1 { text-align: center; margin-bottom: 20px; color: #00d4ff; font-size: 1.5rem; }
-  .cameras { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 20px; }
+  .cameras { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 20px; }
   .cam-panel { background: #16213e; border-radius: 12px; padding: 16px; }
   .cam-panel h2 { font-size: 0.95rem; color: #00d4ff; margin-bottom: 10px; }
   .cam-panel .placeholder {
@@ -292,7 +316,8 @@ _VLN_HTML = """<!DOCTYPE html>
   .actions { display: flex; gap: 8px; margin-top: 12px; }
   #log { margin-top: 12px; max-height: 200px; overflow-y: auto; font-size: 0.8rem; color: #888; }
   #log div { padding: 2px 0; border-bottom: 1px solid #1a1a2e; }
-  @media (max-width: 900px) { .cameras { grid-template-columns: 1fr; } }
+  @media (max-width: 1100px) { .cameras { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 600px) { .cameras { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
@@ -316,6 +341,12 @@ _VLN_HTML = """<!DOCTYPE html>
       <img class="feed" id="cam-depth" src="/depth_feed" alt="RealSense depth"
            onerror="this.style.display='none'; document.getElementById('ph-depth').style.display='flex';">
       <div class="placeholder" id="ph-depth" style="display:none">Waiting for feed…</div>
+    </div>
+    <div class="cam-panel">
+      <h2>Frontier overlay</h2>
+      <img class="feed" id="cam-frontier" src="/frontier_feed" alt="Frontier overlay"
+           onerror="this.style.display='none'; document.getElementById('ph-frontier').style.display='flex';">
+      <div class="placeholder" id="ph-frontier" style="display:none">Waiting for feed…</div>
     </div>
   </div>
   <div class="bottom">

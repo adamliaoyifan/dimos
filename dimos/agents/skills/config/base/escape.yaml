@@ -1,0 +1,10 @@
+# Stuck / escape recovery defaults
+# ----------------------------------
+
+escape:
+  enabled: true
+  stuck_time_window: 6.0
+  stuck_distance_threshold: 0.05
+  escape_backup_distance: 0.3
+  escape_rotate_degrees: 90.0
+  max_escape_attempts: 4

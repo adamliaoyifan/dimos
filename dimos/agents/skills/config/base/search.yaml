@@ -1,0 +1,47 @@
+# Search behaviour defaults
+# --------------------------
+# These are tuning parameters for the VLN search loop.
+# Override per-profile in profiles/<name>.yaml.
+
+search:
+  vlm_check_interval: 1.0
+  search_timeout: 300.0             # hard maximum for full search (seconds)
+  search_stall_timeout: 120.0       # give up after this many seconds of no new coverage
+  search_progress_distance: 1.0    # metres of new trail needed per stall window
+  search_observed_fraction: 0.85   # costmap observed fraction → boundary fully explored → stop
+  approach_timeout: 30.0
+  similarity_threshold: 0.35       # CLIP similarity threshold (reduces noisy self-matches)
+  semantic_near_pose_threshold: 0.5
+
+  # Memory-guided search
+  use_memory: false
+  # Query SpatialMemory every N VLM cycles during active search (use_memory=true).
+  # Set false to use pure online exploration (VLM only, no memory re-query).
+  memory_query_interval: 5
+
+  # Exploration backend:
+  #   "astar"  — WavefrontFrontier + A* path follower (no NavDP)
+  #   "navdp"  — NavDP diffusion-policy nogoal (no global plan)
+  #   "hybrid" — NavDP local obstacle avoidance + A* global path guidance
+  exploration_mode: hybrid
+
+  # hybrid mode: use VLM to rank frontier candidates before selecting goal
+  frontier_vlm_enabled: true
+  frontier_vlm_interval: 5
+  frontier_replan_distance_m: 3.0
+
+  # Detection confirmation
+  confirm_checks: 3
+  confirm_threshold: 2
+  confirm_check_delay: 1.5
+
+  # NavDP imagegoal debug: save the reference image sent to set_reference_image.
+  # Set to "" to disable.
+  navdp_imagegoal_debug_dir: ""
+  navdp_imagegoal_width: 640
+  navdp_imagegoal_height: 480
+
+  # A* approach with 3D depth-based target localisation
+  approach_stop_distance: 0.6
+  approach_min_depth_confidence: 0.3
+  approach_ema_alpha: 0.3

@@ -1,0 +1,19 @@
+# Profile: MuJoCo simulation — office1 scene (single room)
+# ----------------------------------------------------------
+# Usage:
+#   cfg = load_vln_config(profile="sim_office")
+#   VLN_CONFIG=sim_office dimos run unitree-go2-vln-local
+
+_meta:
+  description: "MuJoCo simulation, office1 scene"
+  prompt: sim           # loads prompts/sim.yaml
+
+deployment:
+  enabled: true
+  room_layout: ""
+
+navdp:
+  trajectory_camera: d435i_sim
+
+search:
+  navdp_imagegoal_debug_dir: /home/adamliao/work/dimos/assets/output/memory/spatial_memory

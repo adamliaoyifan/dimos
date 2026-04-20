@@ -27,7 +27,21 @@ from typing import Any
 import yaml
 
 
-_DEFAULT_CONFIG = Path(__file__).parent / "vln_config.yaml"
+_CONFIG_DIR = Path(__file__).parent
+_DEFAULT_CONFIG = _CONFIG_DIR / "vln_config.yaml"  # legacy single-file fallback
+_BASE_DIR = _CONFIG_DIR / "base"
+_PROMPTS_DIR = _CONFIG_DIR / "prompts"
+_PROFILES_DIR = _CONFIG_DIR / "profiles"
+
+# Ordered list of base config files — loaded left to right, later files win.
+_BASE_FILES = [
+    "trajectory.yaml",
+    "search.yaml",
+    "room_exit.yaml",
+    "escape.yaml",
+    "blueprint.yaml",
+]
+_DEFAULT_PROFILE = "sim_office"
 
 
 @dataclass
@@ -61,7 +75,14 @@ class SearchConfig:
     approach_timeout: float = 30.0
     similarity_threshold: float = 0.23
     exploration_mode: str = "astar"
-    """Exploration backend: "astar" (WavefrontFrontier + A*) or "navdp" (diffusion-policy nogoal)."""
+    """Exploration backend: "astar" (WavefrontFrontier + A*), "navdp" (diffusion-policy nogoal),
+    or "hybrid" (NavDP local obstacle avoidance + A* global path guidance)."""
+    frontier_vlm_enabled: bool = False
+    """In hybrid mode: use VLMFrontierJudge to rank frontier candidates before selecting goal."""
+    frontier_vlm_interval: int = 5
+    """In hybrid mode: re-run VLM frontier ranking every N frontier selections."""
+    frontier_replan_distance_m: float = 3.0
+    """In hybrid mode: recompute A* guidance path after the robot travels this many metres."""
     confirm_checks: int = 3
     confirm_threshold: int = 2
 
@@ -85,6 +106,19 @@ class SearchConfig:
     approach_ema_alpha: float = 0.3
     """EMA learning rate for updating the 3D target position during approach."""
 
+    semantic_near_pose_threshold: float = 0.5
+
+    use_memory: bool = True
+    """Query SpatialMemory during the active search loop.
+    When True, periodically re-queries CLIP semantic memory for the target object
+    and navigates toward any match above similarity_threshold instead of continuing
+    blind frontier exploration.  Set False for pure online exploration."""
+
+    memory_query_interval: int = 5
+    """Query memory every N VLM check cycles when use_memory=True.
+    Lower values make memory queries more frequent (more overhead);
+    higher values rely more on frontier exploration between queries."""
+
 
 
 @dataclass
@@ -101,6 +135,8 @@ class TrajectorySelectorConfig:
     horizon_m: float = 1.5
     sample_step: int = 2
     max_trajectory_cost: float = 50.0
+    min_trajectory_length: float = 0.3
+    critic_min_accept: float = -5.0
     explore_weight: float = 5.0
     explore_radius: float = 2.0
     explore_endpoint_bonus: float = 1.0
@@ -109,6 +145,7 @@ class TrajectorySelectorConfig:
     open_space_radius: float = 0.6
     depth_obstacle_m: float = 0.5
     direction_weight: float = 5.0
+    frontier_weight: float = 5.0
 
 
 @dataclass
@@ -145,6 +182,7 @@ class CameraConfig:
     # Full channel = basename + "#sensor_msgs.CompressedImage" (JPEG RGB + PNG depth).
     lcm_rgb_basename: str = "/dimos/realsense/rgb"
     lcm_depth_basename: str = "/dimos/realsense/depth"
+    lcm_camera_info_basename: str = "/dimos/realsense/camera_info"
 
 
 @dataclass
@@ -183,10 +221,85 @@ class NavDPConfig:
     trajectory_selector: TrajectorySelectorConfig = field(
         default_factory=TrajectorySelectorConfig
     )
+    # ROS 2 topic to publish cmd_vel on (for edge device control).
+    # Set to "" to disable the Ros2CmdVelPublisher.
+    ros_cmdvel_topic: str = "/cmd_vel"
 
     def get_trajectory_camera(self) -> CameraConfig:
         """Return the active trajectory camera profile, or a sensible default."""
         return self.cameras.get(self.trajectory_camera, CameraConfig())
+
+
+@dataclass
+class RoomExitConfig:
+    """Configuration for memory-augmented room-exit mode."""
+
+    enabled: bool = False
+    """Enable room-exit mode when the robot saturates the current area."""
+
+    max_exit_depth: int = 2
+    """Maximum recursive room-exit attempts before giving up."""
+
+    vlm_judge_enabled: bool = True
+    """Use Qwen3-VL-8B to rank frontier candidates during room-exit."""
+
+    vlm_judge_top_k: int = 5
+    """Top-K geometric frontiers shown to VLM judge."""
+
+    vlm_judge_weight: float = 0.4
+    """VLM blend weight (1 - this = geometric weight)."""
+
+    vlm_judge_timeout_s: float = 8.0
+    """Maximum seconds to wait for VLM judge response."""
+
+    trail_sample_spacing_m: float = 1.0
+    """Minimum spacing (metres) between thinned trail waypoints."""
+
+    backtrack_novelty_threshold: float = 0.6
+    """Stop backtracking when memory novelty score exceeds this."""
+
+    memory_query_radius_m: float = 1.5
+    """SpatialMemory query radius (metres) per trail waypoint."""
+
+    searched_area_radius_m: float = 2.0
+    """Exclusion radius (metres) around tagged searched locations."""
+
+    nav_timeout_s: float = 45.0
+    """A* navigation timeout for backtrack/exit waypoints."""
+
+
+@dataclass
+class MultiRoomConfig:
+    """Configuration for multi-room discovery and semantic room targeting."""
+
+    enabled: bool = False
+    """Enable two-phase multi-room search: first discover the correct room type,
+    then search for the object within that room.  Set to True for house/multi-room
+    scenes.  When False, the single-room behaviour (search everywhere immediately)
+    is preserved for backward compatibility."""
+
+    room_check_interval_m: float = 2.5
+    """Minimum robot movement (metres) before re-identifying the current room type."""
+
+    max_rooms_to_search: int = 6
+    """Give up after exploring this many distinct room types without finding the
+    target."""
+
+    room_discovery_timeout_s: float = 300.0
+    """Hard time limit for the room discovery loop (seconds)."""
+
+    object_room_map: dict[str, list[str]] = field(default_factory=dict)
+    """Hardcoded fallback mapping from object keywords to likely room types.
+    Used when the VLM fails to infer room types.  Keys are lower-case object
+    keywords; values are ordered lists of room-type strings.
+
+    Example::
+
+        book case: [study room, office, library]
+        refrigerator: [kitchen]
+        sofa: [living room]
+        bed: [bedroom]
+    """
 
 
 @dataclass
@@ -239,8 +352,40 @@ class VLNTestConfig:
     search: SearchConfig = field(default_factory=SearchConfig)
     navdp: NavDPConfig = field(default_factory=NavDPConfig)
     escape: EscapeConfig = field(default_factory=EscapeConfig)
+    room_exit: RoomExitConfig = field(default_factory=RoomExitConfig)
+    multi_room: MultiRoomConfig = field(default_factory=MultiRoomConfig)
     blueprint: BlueprintConfig = field(default_factory=BlueprintConfig)
     deployment: DeploymentConfig = field(default_factory=DeploymentConfig)
+
+
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """Recursively merge *override* into *base*, returning a new dict.
+
+    - Dicts are merged recursively.
+    - All other types (including lists) are replaced by the override value.
+    """
+    result = dict(base)
+    for key, val in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(val, dict):
+            result[key] = _deep_merge(result[key], val)
+        else:
+            result[key] = val
+    return result
+
+
+def _load_yaml(path: Path) -> dict[str, Any]:
+    with open(path) as f:
+        return yaml.safe_load(f) or {}
+
+
+def _load_base_configs() -> dict[str, Any]:
+    """Merge all base/*.yaml files in order."""
+    merged: dict[str, Any] = {}
+    for filename in _BASE_FILES:
+        p = _BASE_DIR / filename
+        if p.exists():
+            merged = _deep_merge(merged, _load_yaml(p))
+    return merged
 
 
 def _parse_navdp_config(raw: dict[str, Any]) -> NavDPConfig:
@@ -263,33 +408,95 @@ def _parse_navdp_config(raw: dict[str, Any]) -> NavDPConfig:
     return navdp
 
 
-def load_vln_config(path: str | Path | None = None) -> VLNTestConfig:
-    """Load VLN configuration from a YAML file.
-
-    Args:
-        path: Path to the YAML config file. If None, uses the default
-              config shipped with DimOS.
-
-    Returns:
-        Parsed VLNTestConfig dataclass.
-    """
-    config_path = Path(path) if path else _DEFAULT_CONFIG
-
-    if not config_path.exists():
-        raise FileNotFoundError(f"VLN config not found: {config_path}")
-
-    with open(config_path) as f:
-        raw: dict[str, Any] = yaml.safe_load(f) or {}
-
+def _build_config(raw: dict[str, Any]) -> VLNTestConfig:
+    """Instantiate VLNTestConfig from a merged raw dict."""
     return VLNTestConfig(
         vlm=VLMConfig(**raw.get("vlm", {})),
         agent=AgentConfig(**raw.get("agent", {})),
         search=SearchConfig(**raw.get("search", {})),
         navdp=_parse_navdp_config(raw.get("navdp", {})),
         escape=EscapeConfig(**raw.get("escape", {})),
+        room_exit=RoomExitConfig(**raw.get("room_exit", {})),
+        multi_room=MultiRoomConfig(**raw.get("multi_room", {})),
         blueprint=BlueprintConfig(**raw.get("blueprint", {})),
         deployment=DeploymentConfig(**raw.get("deployment", {})),
     )
+
+
+def load_vln_config(
+    path: str | Path | None = None,
+    profile: str | None = None,
+) -> VLNTestConfig:
+    """Load VLN configuration.
+
+    Two usage modes:
+
+    **Profile mode** (recommended) — loads base defaults, merges a named
+    prompt file, then merges the profile overrides::
+
+        cfg = load_vln_config(profile="sim_office")
+        cfg = load_vln_config(profile="hardware_go2")
+
+    Profile names correspond to files in
+    ``dimos/agents/skills/config/profiles/<name>.yaml``.
+    When neither *path* nor *profile* is given, the default profile
+    (``sim_office``) is used.
+
+    **Legacy path mode** — loads a single YAML file exactly as before::
+
+        cfg = load_vln_config("path/to/vln_config.yaml")
+        cfg = load_vln_config()  # → loads vln_config.yaml (deprecated)
+
+    The ``VLN_CONFIG`` environment variable can be set to either a file path
+    or a profile name; the blueprint reads it automatically.
+
+    Args:
+        path: Explicit path to a YAML config file (legacy mode).
+        profile: Named deployment profile (e.g. ``"sim_office"``).
+
+    Returns:
+        Parsed and merged :class:`VLNTestConfig`.
+    """
+    # ── Legacy single-file mode ──────────────────────────────────────────
+    if path is not None:
+        config_path = Path(path)
+        # If it's an existing file, load it as a flat single-file config.
+        if config_path.exists():
+            raw = _load_yaml(config_path)
+            return _build_config(raw)
+        # If it looks like a profile name (no path separators, no .yaml ext),
+        # treat it as a profile name for backward compat with VLN_CONFIG=sim_office.
+        if "/" not in str(path) and "\\" not in str(path) and not str(path).endswith(".yaml"):
+            profile = str(path)
+        else:
+            raise FileNotFoundError(f"VLN config not found: {config_path}")
+
+    # ── Profile mode ─────────────────────────────────────────────────────
+    profile = profile or _DEFAULT_PROFILE
+    profile_path = _PROFILES_DIR / f"{profile}.yaml"
+    if not profile_path.exists():
+        raise FileNotFoundError(
+            f"VLN profile '{profile}' not found: {profile_path}\n"
+            f"Available profiles: {[p.stem for p in _PROFILES_DIR.glob('*.yaml')]}"
+        )
+
+    # 1. Base defaults
+    raw = _load_base_configs()
+
+    # 2. Load profile to get _meta.prompt
+    profile_raw = _load_yaml(profile_path)
+    prompt_name = (profile_raw.pop("_meta", {}) or {}).get("prompt", None)
+
+    # 3. Merge prompt file if specified
+    if prompt_name:
+        prompt_path = _PROMPTS_DIR / f"{prompt_name}.yaml"
+        if prompt_path.exists():
+            raw = _deep_merge(raw, _load_yaml(prompt_path))
+
+    # 4. Merge profile overrides (profile wins over base + prompt)
+    raw = _deep_merge(raw, profile_raw)
+
+    return _build_config(raw)
 
 
 __all__ = [
@@ -301,6 +508,8 @@ __all__ = [
     "CameraConfig",
     "TrajectorySelectorConfig",
     "EscapeConfig",
+    "RoomExitConfig",
+    "MultiRoomConfig",
     "BlueprintConfig",
     "DeploymentConfig",
     "load_vln_config",

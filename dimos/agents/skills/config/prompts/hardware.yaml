@@ -1,0 +1,14 @@
+# VLM prompt prefix for real hardware (Unitree Go2 + RealSense)
+# ---------------------------------------------------------------
+# Prepended to every VLM query when deployment.enabled = false.
+
+deployment:
+  vlm_prompt_prefix: ""
+  hardware_vlm_prompt_prefix: >-
+    This image is from a real robot camera (Unitree Go2 quadruped) in a
+    real indoor environment. The camera is mounted low (~30 cm above
+    ground) and tilted slightly downward. Objects appear from a low
+    viewpoint — furniture legs and the underside of tables are prominent.
+    Lighting may vary (shadows, glare, dim areas). Identify objects by
+    their real-world appearance. Be aware that the wide-angle lens may
+    cause slight barrel distortion near image edges.

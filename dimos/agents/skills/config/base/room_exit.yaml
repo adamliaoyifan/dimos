@@ -1,0 +1,52 @@
+# Room-exit and multi-room defaults
+# ------------------------------------
+# room_exit: memory-augmented frontier exit when robot saturates a room.
+# multi_room: two-phase search — find the right room type first.
+# Both disabled by default; enable per-profile for multi-room scenes.
+
+room_exit:
+  enabled: false
+
+  max_exit_depth: 2
+
+  vlm_judge_enabled: true
+  vlm_judge_top_k: 5
+  vlm_judge_weight: 0.4
+  vlm_judge_timeout_s: 8.0
+
+  trail_sample_spacing_m: 1.0
+  backtrack_novelty_threshold: 0.6
+  memory_query_radius_m: 1.5
+
+  searched_area_radius_m: 2.0
+  nav_timeout_s: 45.0
+
+multi_room:
+  enabled: false
+
+  room_check_interval_m: 2.5
+  max_rooms_to_search: 6
+  room_discovery_timeout_s: 300.0
+
+  # Fallback: object keyword → likely room types (used when VLM fails)
+  object_room_map:
+    book case: [study room, office, library]
+    bookcase: [study room, office, library]
+    bookshelf: [study room, office, library]
+    desk: [study room, office, bedroom]
+    computer: [study room, office]
+    refrigerator: [kitchen]
+    fridge: [kitchen]
+    stove: [kitchen]
+    oven: [kitchen]
+    sink: [kitchen, bathroom]
+    toilet: [bathroom]
+    bathtub: [bathroom]
+    shower: [bathroom]
+    sofa: [living room]
+    couch: [living room]
+    television: [living room, bedroom]
+    tv: [living room, bedroom]
+    bed: [bedroom]
+    wardrobe: [bedroom]
+    dining table: [dining room, kitchen]
