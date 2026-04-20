@@ -240,6 +240,15 @@ class SpatialMemory(Module[SpatialConfig]):
                     ]
                 )
                 if distance_moved < self.min_distance_threshold:
+                    # Heartbeat: every 60 frames log that storage is being
+                    # skipped so the user knows the robot is stationary.
+                    if self.frame_count % 60 == 0:
+                        logger.info(
+                            "[SpatialMemory] heartbeat: frame_count=%d stored=%d "
+                            "— robot stationary (moved=%.4fm < threshold=%.4fm)",
+                            self.frame_count, self.stored_frame_count,
+                            distance_moved, self.min_distance_threshold,
+                        )
                     logger.debug(
                         f"Position has not moved enough: {distance_moved:.4f}m < {self.min_distance_threshold}m, skipping frame"
                     )
@@ -461,7 +470,24 @@ class SpatialMemory(Module[SpatialConfig]):
             List of results, each containing the image, its metadata, and similarity score
         """
         logger.info(f"Querying spatial memory with text: '{text}'")
-        return self.vector_db.query_by_text(text, limit)
+        results = self.vector_db.query_by_text(text, limit)
+        if results:
+            top = results[0]
+            top_dist = top.get("distance")
+            top_sim = round(1.0 - top_dist, 4) if top_dist is not None else None
+            meta = top.get("metadata")
+            top_pos = None
+            if meta:
+                m = meta[0] if isinstance(meta, list) else meta
+                top_pos = (round(m.get("pos_x", 0), 2), round(m.get("pos_y", 0), 2))
+            logger.info(
+                "[SpatialMemory] query_by_text '%s': %d results — "
+                "top_dist=%.4f top_similarity=%.4f top_pos=%s",
+                text, len(results), top_dist, top_sim, top_pos,
+            )
+        else:
+            logger.info("[SpatialMemory] query_by_text '%s': 0 results (DB empty?)", text)
+        return results
 
     @rpc
     def add_robot_location(self, location: RobotLocation) -> bool:
@@ -561,6 +587,11 @@ class SpatialMemory(Module[SpatialConfig]):
 
     @rpc
     def tag_location(self, robot_location: RobotLocation) -> bool:
+        logger.info(
+            "[SpatialMemory] tag_location: name='%s' pos=%s",
+            robot_location.name,
+            getattr(robot_location, "position", "?"),
+        )
         try:
             self.vector_db.tag_location(robot_location)
         except Exception:
@@ -570,7 +601,18 @@ class SpatialMemory(Module[SpatialConfig]):
     @rpc
     def query_tagged_location(self, query: str) -> RobotLocation | None:
         location, semantic_distance = self.vector_db.query_tagged_location(query)
-        if semantic_distance < 0.3:
+        _threshold = 0.3
+        _verdict = "RETURNED" if semantic_distance < _threshold else "REJECTED (dist >= threshold)"
+        logger.info(
+            "[SpatialMemory] query_tagged_location '%s': "
+            "best_match='%s' distance=%.4f threshold=%.1f → %s",
+            query,
+            location.name if location else "None",
+            semantic_distance,
+            _threshold,
+            _verdict,
+        )
+        if semantic_distance < _threshold:
             return location
         return None
 

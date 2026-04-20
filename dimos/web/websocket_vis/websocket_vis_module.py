@@ -106,6 +106,7 @@ class WebsocketVisModule(Module[WebsocketConfig]):
     depth_image: In[Image]
     realsense_image: In[Image]
     realsense_depth: In[Image]
+    frontier_overlay_image: In[Image]
 
     # LCM outputs
     goal_request: Out[PoseStamped]
@@ -139,6 +140,7 @@ class WebsocketVisModule(Module[WebsocketConfig]):
         self._last_depth_emit: float = 0.0
         self._last_rs_color_emit: float = 0.0
         self._last_rs_depth_emit: float = 0.0
+        self._last_frontier_emit: float = 0.0
         self._image_emit_interval: float = 0.2
 
         # Track GPS goal points for visualization
@@ -237,6 +239,12 @@ class WebsocketVisModule(Module[WebsocketConfig]):
 
         try:
             unsub = self.realsense_depth.subscribe(self._on_realsense_depth)
+            self._disposables.add(Disposable(unsub))
+        except Exception:
+            ...
+
+        try:
+            unsub = self.frontier_overlay_image.subscribe(self._on_frontier_overlay)
             self._disposables.add(Disposable(unsub))
         except Exception:
             ...
@@ -492,6 +500,15 @@ class WebsocketVisModule(Module[WebsocketConfig]):
         if b64:
             self._emit("debug_rs_depth_image", b64)
 
+    def _on_frontier_overlay(self, msg: Image) -> None:
+        now = time.time()
+        if now - self._last_frontier_emit < self._image_emit_interval:
+            return
+        self._last_frontier_emit = now
+        b64 = self._image_to_base64(msg)
+        if b64:
+            self._emit("debug_frontier_overlay", b64)
+
     @staticmethod
     def _image_to_base64(img: Image, is_depth: bool = False) -> str | None:
         """Encode a DimOS Image to a base64 JPEG string."""
@@ -575,13 +592,18 @@ _DEBUG_IMAGES_HTML = """\
     <img id="rs-depth" alt="waiting for D435i depth..." />
     <div class="status" id="rs-depth-status">Waiting...</div>
   </div>
+  <div class="panel">
+    <h2>Frontier Overlay</h2>
+    <img id="frontier" alt="waiting for frontier overlay..." />
+    <div class="status" id="frontier-status">Waiting...</div>
+  </div>
 </div>
 <script>
   const socket = io({ transports: ['websocket', 'polling'] });
-  let colorCount = 0, depthCount = 0, rsColorCount = 0, rsDepthCount = 0;
+  let colorCount = 0, depthCount = 0, rsColorCount = 0, rsDepthCount = 0, frontierCount = 0;
 
   socket.on('connect', () => {
-    ['color-status','depth-status','rs-color-status','rs-depth-status'].forEach(
+    ['color-status','depth-status','rs-color-status','rs-depth-status','frontier-status'].forEach(
       id => document.getElementById(id).textContent = 'Connected, waiting for frames...'
     );
   });
@@ -610,8 +632,14 @@ _DEBUG_IMAGES_HTML = """\
     document.getElementById('rs-depth-status').textContent = 'Frame #' + rsDepthCount;
   });
 
+  socket.on('debug_frontier_overlay', (b64) => {
+    frontierCount++;
+    document.getElementById('frontier').src = 'data:image/jpeg;base64,' + b64;
+    document.getElementById('frontier-status').textContent = 'Frame #' + frontierCount;
+  });
+
   socket.on('disconnect', () => {
-    ['color-status','depth-status','rs-color-status','rs-depth-status'].forEach(
+    ['color-status','depth-status','rs-color-status','rs-depth-status','frontier-status'].forEach(
       id => document.getElementById(id).textContent = 'Disconnected'
     );
   });

@@ -95,7 +95,10 @@ from dimos.core.blueprints import autoconnect
 from dimos.core.transport import LCMTransport, pSHMTransport
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
 from dimos.msgs.geometry_msgs.Twist import Twist
+from dimos.msgs.nav_msgs.OccupancyGrid import OccupancyGrid
+from dimos.msgs.sensor_msgs.CameraInfo import CameraInfo
 from dimos.msgs.sensor_msgs.Image import Image
+from dimos.navigation.frontier_exploration.frontier_overlay import FrontierOverlayModule
 from dimos.robot.unitree.go2.blueprints.smart.unitree_go2_spatial import unitree_go2_spatial
 from dimos.robot.unitree.go2.connection import GO2Connection
 from dimos.robot.unitree.unitree_skill_container import UnitreeSkillContainer
@@ -185,7 +188,11 @@ _is_realsense_lcm = cfg.navdp.trajectory_camera == "realsense_lcm"
 _is_d435i_sim = cfg.navdp.trajectory_camera == "d435i_sim"
 _is_d455i_sim = cfg.navdp.trajectory_camera == "d455i_sim"
 _uses_realsense_shm = _is_realsense_ros or _is_realsense_lcm or _is_d435i_sim or _is_d455i_sim
-_vln_web_blueprint = VLNWebInput.blueprint(port=5556)
+_vln_web_blueprint = VLNWebInput.blueprint(port=5556).transports(
+    {
+        ("frontier_overlay_image", Image): pSHMTransport("frontier_overlay_image"),
+    }
+)
 if _uses_realsense_shm:
     _vln_web_blueprint = _vln_web_blueprint.transports(
         {
@@ -317,6 +324,7 @@ if cfg.navdp.enabled:
             LcmRealsenseRelay.blueprint(
                 lcm_rgb_basename=_traj_cam.lcm_rgb_basename,
                 lcm_depth_basename=_traj_cam.lcm_depth_basename,
+                lcm_camera_info_basename=_traj_cam.lcm_camera_info_basename,
                 depth_scale=_traj_cam.ros2_depth_scale,
             ).transports(
                 {
@@ -326,8 +334,12 @@ if cfg.navdp.enabled:
                     ("depth_ingress", CompressedImage): LCMTransport(
                         _traj_cam.lcm_depth_basename, CompressedImage
                     ),
+                    ("camera_info_ingress", CameraInfo): LCMTransport(
+                        _traj_cam.lcm_camera_info_basename, CameraInfo
+                    ),
                     ("realsense_image", Image): pSHMTransport("realsense_image"),
                     ("realsense_depth", Image): pSHMTransport("realsense_depth"),
+                    ("realsense_camera_info", CameraInfo): pSHMTransport("realsense_camera_info"),
                 }
             )
         )
@@ -373,7 +385,9 @@ if cfg.navdp.enabled:
                 ("navdp_depth", Image): _navdp_depth_transport,
                 ("topdown_map", Image): pSHMTransport("topdown_map"),
                 ("odom", PoseStamped): pSHMTransport("odom"),
+                ("realsense_camera_info", CameraInfo): pSHMTransport("realsense_camera_info"),
                 ("cmd_vel", Twist): pSHMTransport("cmd_vel"),
+                ("global_costmap", OccupancyGrid): pSHMTransport("global_costmap"),
             }
         )
     )
@@ -423,6 +437,24 @@ _all_components = [
         cam_pitch=_traj_cam.pitch,
         # Room layout YAML for SpatialMemory seeding (empty = disabled)
         room_layout=cfg.deployment.room_layout,
+        # Room-exit mode
+        room_exit_enabled=cfg.room_exit.enabled,
+        room_exit_max_depth=cfg.room_exit.max_exit_depth,
+        room_exit_vlm_judge_enabled=cfg.room_exit.vlm_judge_enabled,
+        room_exit_vlm_judge_top_k=cfg.room_exit.vlm_judge_top_k,
+        room_exit_vlm_judge_weight=cfg.room_exit.vlm_judge_weight,
+        room_exit_vlm_judge_timeout_s=cfg.room_exit.vlm_judge_timeout_s,
+        room_exit_trail_sample_spacing_m=cfg.room_exit.trail_sample_spacing_m,
+        room_exit_backtrack_novelty_threshold=cfg.room_exit.backtrack_novelty_threshold,
+        room_exit_memory_query_radius_m=cfg.room_exit.memory_query_radius_m,
+        room_exit_searched_area_radius_m=cfg.room_exit.searched_area_radius_m,
+        room_exit_nav_timeout_s=cfg.room_exit.nav_timeout_s,
+        # Multi-room discovery
+        multi_room_enabled=cfg.multi_room.enabled,
+        multi_room_check_interval_m=cfg.multi_room.room_check_interval_m,
+        multi_room_max_rooms=cfg.multi_room.max_rooms_to_search,
+        multi_room_discovery_timeout_s=cfg.multi_room.room_discovery_timeout_s,
+        multi_room_object_room_map=cfg.multi_room.object_room_map,
     ).transports(
         {
             ("depth_image", Image): pSHMTransport("depth_image"),
@@ -436,6 +468,24 @@ _all_components = [
 #     _all_components.append(_escape_blueprint)
 
 _all_components.extend(_navdp_blueprints)
+
+# ── Frontier overlay (projects frontier points onto camera image) ────
+_all_components.append(
+    FrontierOverlayModule.blueprint(
+        cam_intrinsic=_cam_intrinsic_list,
+        cam_x=_traj_cam.x,
+        cam_y=_traj_cam.y,
+        cam_z=_traj_cam.z,
+        cam_pitch=_traj_cam.pitch,
+    ).transports(
+        {
+            ("color_image", Image): pSHMTransport("color_image"),
+            ("odom", PoseStamped): pSHMTransport("odom"),
+            ("frontier_overlay_image", Image): pSHMTransport("frontier_overlay_image"),
+        }
+    )
+)
+
 
 # Flatten the 3×3 intrinsic matrix to a 9-element row-major list for GlobalConfig.
 _rs_intrinsic_flat: list[float] | None = (
