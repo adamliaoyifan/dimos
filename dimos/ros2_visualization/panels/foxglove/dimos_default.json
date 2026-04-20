@@ -1,0 +1,121 @@
+{
+  "$schema": "https://foxglove.dev/schema/studio-layout@1",
+  "configById": {
+    "3d-panel": {
+      "cameraState": {
+        "distance": 12,
+        "perspective": true,
+        "phi": 55,
+        "target": [0, 0, 0],
+        "targetOffset": [0, 0, 0],
+        "targetOrientation": [0, 0, 0, 1],
+        "theta": 10,
+        "fovy": 45
+      },
+      "followTf": "base_link",
+      "followMode": "follow-pose",
+      "topics": {
+        "/viz/odom": { "visible": false },
+        "/viz/path": {
+          "visible": true,
+          "type": "nav_msgs/Path",
+          "color": "#00aaff",
+          "lineWidth": 0.03
+        },
+        "/viz/trajectory": {
+          "visible": true,
+          "type": "visualization_msgs/MarkerArray"
+        },
+        "/viz/memory/markers": {
+          "visible": true,
+          "type": "visualization_msgs/MarkerArray"
+        },
+        "/viz/frontiers": {
+          "visible": true,
+          "type": "visualization_msgs/MarkerArray"
+        },
+        "/viz/costmap": {
+          "visible": true,
+          "type": "nav_msgs/OccupancyGrid",
+          "alpha": 0.7,
+          "colorMode": "costmap"
+        },
+        "/tf": { "visible": true },
+        "/viz/pointcloud": {
+          "visible": true,
+          "type": "sensor_msgs/PointCloud2",
+          "colorMode": "flat",
+          "flatColor": "#44ffaa",
+          "pointSize": 2
+        }
+      }
+    },
+    "image-panel": {
+      "cameraTopic": "/viz/image/compressed",
+      "rotation": 0,
+      "flipHorizontal": false,
+      "flipVertical": false,
+      "maxZoom": 5,
+      "mode": "fit",
+      "smooth": true
+    },
+    "memory-thumb-panel": {
+      "cameraTopic": "/viz/memory/thumbnail",
+      "rotation": 0,
+      "mode": "fit"
+    },
+    "rawmsg-trajectory-panel": {
+      "topicPath": "/viz/trajectory/metadata"
+    },
+    "rawmsg-memory-panel": {
+      "topicPath": "/viz/memory/metadata"
+    },
+    "rawmsg-query-panel": {
+      "topicPath": "/viz/memory/query"
+    }
+  },
+  "layout": {
+    "direction": "row",
+    "first": {
+      "direction": "column",
+      "first": {
+        "id": "3d-panel",
+        "type": "3d"
+      },
+      "second": {
+        "direction": "row",
+        "first": {
+          "id": "image-panel",
+          "type": "Image"
+        },
+        "second": {
+          "id": "memory-thumb-panel",
+          "type": "Image"
+        },
+        "splitPercentage": 50
+      },
+      "splitPercentage": 65
+    },
+    "second": {
+      "direction": "column",
+      "first": {
+        "id": "rawmsg-trajectory-panel",
+        "type": "RawMessages"
+      },
+      "second": {
+        "direction": "column",
+        "first": {
+          "id": "rawmsg-memory-panel",
+          "type": "RawMessages"
+        },
+        "second": {
+          "id": "rawmsg-query-panel",
+          "type": "RawMessages"
+        },
+        "splitPercentage": 50
+      },
+      "splitPercentage": 33
+    },
+    "splitPercentage": 72
+  }
+}
